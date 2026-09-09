@@ -3,12 +3,12 @@
 		"description": "5G 模块状态只读访问（T99W368）",
 		"read": {
 			"ubus": {
-				"modem5g": [ "status", "list", "scan", "sms_list", "usage", "sim_info", "watchdog_status", "temp" ]
+				"modem5g": [ "status", "list", "sms_list", "usage", "sim_info", "watchdog_status", "temp", "trend", "speed" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"modem5g": [ "redial", "set_apn", "set_mode", "enable", "disable", "reset", "set_bands", "sms_send", "sms_delete", "auto_back", "ping_test", "ussd_query", "at_cmd" ]
+				"modem5g": [ "redial", "set_apn", "set_mode", "enable", "disable", "reset", "scan", "set_bands", "sms_send", "sms_delete", "auto_back", "ping_test", "ussd_query", "at_cmd", "diagnostic" ]
 			}
 		}
 	}

@@ -12,6 +12,22 @@ const exec = (cmd) => {
 	return out || "";
 };
 
+// 带超时的命令执行（防止单条重命令长时间阻塞 rpcd 串行队列，导致全 LuCI 排队）
+const execm = (cmd, secs) => {
+	const t = secs || 10;
+	return exec("timeout " + t + " " + cmd);
+};
+
+// 本机 ucode 构建的全局 join() 在 rpcd 环境返回 null（实测缺陷）→ 手写拼接
+function joinArr(arr, sep) {
+	let out = "";
+	for (let i = 0; i < length(arr); i++) {
+		if (i > 0) out += sep;
+		out += arr[i];
+	}
+	return out;
+};
+
 function firstMatch(text, re) {
 	let m = match(text, re);
 	return m ? m[1] : "";
@@ -19,24 +35,43 @@ function firstMatch(text, re) {
 
 // 动态获取当前 Modem 索引（热插拔/重枚举后编号会递增）
 function getModemIndex() {
-	const L = exec("mmcli -L");
+	const L = execm("mmcli -L", 8);
 	return firstMatch(L, /Modem\/(\d+)/) || "";
 }
 
-// 同步 uci device 到当前索引（重拨前校准，防止 device 失配导致 proto 找不到 modem）
-function syncDeviceIndex(idx) {
+// 将 MM 索引解析为 sysfs 物理路径（netifd proto modemmanager 要求路径；数值索引会漂移不可靠）
+function modemSysfsPath(idx) {
+	return trim(execm("sh /usr/bin/m5g-dev.sh " + idx, 8));
+}
+
+// 同步 uci device 到当前 modem 的 sysfs 路径（重拨前校准；仅变化时写防刷 flash）
+function syncDevicePath(idx) {
 	if (!idx)
 		return;
+	const path = modemSysfsPath(idx);
+	if (!path)
+		return;
 	const cur = trim(exec("uci get network.wwan.device 2>/dev/null"));
-	if (cur != idx) {
-		exec("uci set network.wwan.device='" + idx + "'");
+	if (cur != path) {
+		exec("uci set network.wwan.device='" + path + "'");
 		exec("uci commit network");
 	}
 }
 
+// hold 文件（内容=epoch 秒），与看门狗互斥：看门狗见 <120s 的新 hold 让路
+const HOLD = {
+	redial: "/tmp/m5g-redial.hold",
+	reset: "/tmp/m5g-reset.hold",
+	scan: "/tmp/m5g-scan.hold"
+};
+function holdSet(key) { exec("date +%s > " + HOLD[key]); }
+function holdClear(key) { exec("rm -f " + HOLD[key]); }
+
 // mmcli --output-json 结构化状态（无 ANSI 颜色码，比表格解析稳）
 function mmStatus(idx) {
-	let out = exec("mmcli -m " + idx + " --output-json 2>&1");
+	if (!idx)
+		return {};
+	let out = execm("mmcli -m " + idx + " --output-json 2>&1", 8);
 	let j = null;
 	try {
 		j = json(out);
@@ -63,7 +98,7 @@ function mmStatus(idx) {
 	}
 	// 扩展信号（RSRP/RSRQ/SINR，MM 原生 MBIM signal 扩展，无需 AT 口）
 	let sig5g = {}, sigLte = {};
-	const sigOut = exec("mmcli -m " + idx + " --signal-setup=3 >/dev/null 2>&1; mmcli -m " + idx + " --signal-get --output-json 2>&1");
+	const sigOut = execm("mmcli -m " + idx + " --signal-setup=30 >/dev/null 2>&1; mmcli -m " + idx + " --signal-get --output-json 2>&1", 8);
 	try {
 		const sj = json(sigOut);
 		const ss = sj && sj.modem && sj.modem.signal ? sj.modem.signal : {};
@@ -94,7 +129,7 @@ function mmStatus(idx) {
 		registration: p["registration-state"] || "",
 		packet_state: p["packet-service-state"] || "",
 		primary_port: g["primary-port"] || "",
-		ports: join(g["ports"] || [], ", "),
+		ports: joinArr(g["ports"] || [], ", "),
 		cur_bands: g["current-bands"] || [],
 		ngran_bands: ngran,
 		cur_allowed: curAllowed,
@@ -108,22 +143,35 @@ function mmStatus(idx) {
 	};
 }
 
-// 重拨数据面（ifdown + sleep + ifup），最多等 ~30s，返回是否拿到 IP
+// 重拨数据面（ifdown + sleep + ifup），最多等 ~30s；验证真实连通（ping 网关）防假连接
+// 全程持 redial.hold 与看门狗互斥；先校准 device 为 sysfs 路径
 function doRedial() {
 	const idx = getModemIndex();
-	syncDeviceIndex(idx);
-	exec("ifdown wwan 2>/dev/null");
+	syncDevicePath(idx);
+	holdSet("redial");
+	execm("ifdown wwan 2>/dev/null", 15);
 	exec("sleep 2");
-	exec("ifup wwan 2>/dev/null");
+	execm("ifup wwan 2>/dev/null", 20);
 	let ok = false, ip = "";
 	for (let i = 0; i < 10; i++) {
 		exec("sleep 3");
-		ip = firstMatch(exec("ip addr show wwan0 2>/dev/null"), /inet\s+([0-9.]+)/);
+		ip = firstMatch(execm("ip addr show wwan0 2>/dev/null", 8), /inet\s+([0-9.]+)/);
 		if (ip) {
+			// 验证真实连通：ping 默认网关（曾有"有 IP 但网关不通"假连接）
+			const gw = firstMatch(execm("ip route 2>/dev/null | grep wwan0 | grep default", 8), /default via (\S+)/);
+			if (gw) {
+				if (match(execm("ping -c 1 -W 2 " + gw + " 2>&1", 8), /1 (packets )?received/)) {
+					ok = true;
+					break;
+				}
+				// 假连接：继续等下一轮（模块可能在切换/重拨）
+				continue;
+			}
 			ok = true;
 			break;
 		}
 	}
+	holdClear("redial");
 	return { ok: ok, modem_index: idx, ipv4: ip };
 }
 
@@ -188,7 +236,7 @@ const methods = {
 				signal_lte_rsrp: info["signal_lte_rsrp"],
 				signal_lte_snr: info["signal_lte_snr"],
 				wwan0_ipv4: firstMatch(wwan, /inet\s+([0-9.]+)/) || "",
-				wwan0_ipv6: firstMatch(wwan, /inet6\s+([0-9a-f:]+)/) || "",
+				wwan0_ipv6: firstMatch(execm("ip -6 addr show wwan0 scope global 2>/dev/null", 8), /inet6\s+([0-9a-f:]+)/) || "",
 				cfg_device: trim(exec("uci get network.wwan.device 2>/dev/null")),
 				cfg_apn: trim(exec("uci get network.wwan.apn 2>/dev/null")),
 				scan_state: sc.state,
@@ -229,7 +277,12 @@ const methods = {
 			const pass = trim(request.args.password || "");
 			if (user && !match(user, /^[A-Za-z0-9.@_-]{0,63}$/))
 				return { ok: false, error: "用户名格式非法" };
+			// 防单引号注入（rpcd 为 root）：单引号包裹的 uci 值里其他字符均为字面量，只禁单引号 + 限长
+			if (length(pass) > 63 || match(pass, /'/))
+				return { ok: false, error: "密码含非法字符（不允许单引号，且不超过 63 字符）" };
 			exec("cp /etc/config/network /tmp/network.bak.m5g");
+			exec("cp /etc/config/network /tmp/network.bak.m5g.$(date +%s)");
+			exec("ls /tmp/network.bak.m5g.* 2>/dev/null | sort | sed -n '6,$p' | xargs rm -f 2>/dev/null");
 			exec("uci set network.wwan.apn='" + apn + "'");
 			if (user)
 				exec("uci set network.wwan.username='" + user + "'");
@@ -272,10 +325,37 @@ const methods = {
 					return { ok: false, error: "优先制式非法" };
 			}
 			const idx = getModemIndex();
+			// 记录切换前制式（供收信/发短信后自动恢复原制式，不再写死 3g|4g|5g）
+			// 重枚举过渡期 MM 可能报 allowed: null → 重试一次；仍无效则不覆盖已有有效记录
+			let beforeJson = execm("mmcli -m " + idx + " --output-json 2>&1", 8);
+			let bm = "";
+			try {
+				let bj = json(beforeJson);
+				bm = bj && bj.modem && bj.modem.generic ? (bj.modem.generic["current-modes"] || "") : "";
+			} catch (e) {}
+			if (match(bm, /null/) || bm == "") {
+				sleep(2);
+				beforeJson = execm("mmcli -m " + idx + " --output-json 2>&1", 8);
+				try {
+					let bj = json(beforeJson);
+					bm = bj && bj.modem && bj.modem.generic ? (bj.modem.generic["current-modes"] || "") : "";
+				} catch (e) {}
+			}
+			const bmm = match(bm, /allowed:\s*([^;]+);\s*preferred:\s*(\S+)/);
+			if (bmm) {
+				const bn = [];
+				for (let p in split(bmm[1], ",")) {
+					const t = trim(p);
+					if (t && t != "null") push(bn, t);
+				}
+				const allowedNorm = joinArr(bn, "|");
+				if (allowedNorm && !match(allowedNorm, /null/))
+					writefile("/tmp/m5g-mode-before", allowedNorm + "\n" + trim(bmm[2]) + "\n");
+			}
 			let cmd = "mmcli -m " + idx + " --set-allowed-modes=\"" + allowed + "\"";
 			if (preferred)
 				cmd += " --set-preferred-mode=\"" + preferred + "\"";
-			const out = exec(cmd + " 2>&1");
+			const out = execm(cmd + " 2>&1", 20);
 			const ok = !!match(out, /successfully/);
 			return { ok: ok, output: trim(out),
 				detail: ok ? "网络制式已切换" : "切换失败: " + trim(out) };
@@ -285,7 +365,7 @@ const methods = {
 	enable: {
 		call: function() {
 			const idx = getModemIndex();
-			const out = exec("mmcli -m " + idx + " -e 2>&1");
+			const out = execm("mmcli -m " + idx + " -e 2>&1", 15);
 			const ok = !!match(out, /successfully/);
 			return { ok: ok, detail: ok ? "模块已启用" : "启用失败: " + trim(out) };
 		}
@@ -294,7 +374,7 @@ const methods = {
 	disable: {
 		call: function() {
 			const idx = getModemIndex();
-			const out = exec("mmcli -m " + idx + " -d 2>&1");
+			const out = execm("mmcli -m " + idx + " -d 2>&1", 15);
 			const ok = !!match(out, /successfully/);
 			return { ok: ok, detail: ok ? "模块已禁用" : "禁用失败: " + trim(out) };
 		}
@@ -314,10 +394,12 @@ const methods = {
 	reset: {
 		call: function() {
 			const idx = getModemIndex();
-			const out = exec("mmcli -m " + idx + " -r 2>&1");
+			const out = execm("mmcli -m " + idx + " -r 2>&1", 20);
 			const ok = !!match(out, /successfully/);
-			if (ok)
+			if (ok) {
+				holdSet("reset");
 				exec("sh /usr/bin/m5g-reset-restore.sh >/dev/null 2>&1 &");
+			}
 			return { ok: ok, detail: ok ? "模块复位中，约 1 分钟自动恢复，期间 5G 不可用" : "复位失败: " + trim(out) };
 		}
 	},
@@ -341,7 +423,7 @@ const methods = {
 			if (!okb)
 				return { ok: false, error: "频段格式非法" };
 			const idx = getModemIndex();
-			const out = exec("mmcli -m " + idx + " --set-current-bands=\"" + bands + "\" 2>&1");
+			const out = execm("mmcli -m " + idx + " --set-current-bands=\"" + bands + "\" 2>&1", 20);
 			const ok = !!match(out, /successfully/);
 			return { ok: ok, detail: ok ? "频段设置已应用" : "设置失败: " + trim(out) };
 		}
@@ -350,7 +432,7 @@ const methods = {
 	sms_list: {
 		call: function() {
 			const idx = getModemIndex();
-			const L = exec("mmcli -m " + idx + " --messaging-list-sms 2>&1");
+			const L = execm("mmcli -m " + idx + " --messaging-list-sms 2>&1", 8);
 			const smsPaths = [];
 			for (let line in split(L, "\n")) {
 				let m = match(line, /SMS\/(\d+)\s+\((\w+)\)/);
@@ -359,7 +441,7 @@ const methods = {
 			}
 			const list = [];
 			for (let s in smsPaths) {
-				const out = exec("mmcli -s " + s.index + " --output-json 2>&1");
+				const out = execm("mmcli -s " + s.index + " --output-json 2>&1", 8);
 				try {
 					const j = json(out);
 					const sms = j && j.sms ? j.sms : {};
@@ -374,9 +456,10 @@ const methods = {
 					});
 				} catch (e) {}
 			}
-			// 倒序：最新在前
+			// 倒序：最新在前；上限 20 条（防列表膨胀）
 			const rev = [];
-			for (let i = length(list) - 1; i >= 0; i--)
+			const cap = length(list) > 20 ? length(list) - 20 : 0;
+			for (let i = length(list) - 1; i >= cap; i--)
 				push(rev, list[i]);
 			return { sms: rev };
 		}
@@ -397,14 +480,31 @@ const methods = {
 			// 文本写文件，用 --messaging-create-sms-with-text 创建：
 			// 属性方式对空格(需 NBSP)和逗号(键值分隔符)都敏感，文件方式任意字符安全
 			writefile("/tmp/m5g-sms.txt", text);
-			const out = exec("mmcli -m " + idx + " --messaging-create-sms=\"number=" + number + "\" --messaging-create-sms-with-text=/tmp/m5g-sms.txt 2>&1");
+			const out = execm("mmcli -m " + idx + " --messaging-create-sms=\"" + number + "\" --messaging-create-sms-with-text=/tmp/m5g-sms.txt 2>&1", 20);
 			let m = match(out, /SMS\/(\d+)/);
 			if (!m)
 				return { ok: false, error: "创建短信失败: " + trim(out) };
 			const sid = m[1];
-			const sent = exec("mmcli -s " + sid + " --send 2>&1");
-			const ok = !!match(sent, /successfully/);
-			return { ok: ok, detail: ok ? "短信已发送" : "发送失败: " + trim(sent), sms_id: sid };
+			const sent = execm("mmcli -s " + sid + " --send 2>&1", 20);
+			let ok = !!match(sent, /successfully/);
+			// MM 发送是异步的：轮询状态确认已发出/失败（而非固定等待后盲目切回）
+			let state = "";
+			for (let i = 0; i < 15; i++) {
+				const so = execm("mmcli -s " + sid + " --output-json 2>&1", 6);
+				try {
+					const sj = json(so);
+					state = (sj && sj.sms && sj.sms.properties && sj.sms.properties["state"]) || "";
+				} catch (e) {}
+				if (state == "sent" || state == "failed" || state == "unknown") break;
+				sleep(1);
+			}
+			if (state == "failed") ok = false;
+			let detail;
+			if (state == "sent") detail = "短信已发送";
+			else if (state == "failed") detail = "发送失败(模块回报 failed): " + trim(sent);
+			else if (state) detail = "已提交，状态: " + state;
+			else detail = ok ? "短信已发送" : "发送失败: " + trim(sent);
+			return { ok: ok, detail: detail, sms_id: sid };
 		}
 	},
 	// 控制：删除短信（index 为 SMS/N 的数字）
@@ -415,7 +515,7 @@ const methods = {
 			if (!match(index, /^[0-9]{1,4}$/))
 				return { ok: false, error: "索引非法" };
 			const idx = getModemIndex();
-			const out = exec("mmcli -m " + idx + " --messaging-delete-sms=" + index + " 2>&1");
+			const out = execm("mmcli -m " + idx + " --messaging-delete-sms=" + index + " 2>&1", 10);
 			const ok = !!match(out, /successfully/);
 			return { ok: ok, detail: ok ? "短信已删除" : "删除失败: " + trim(out) };
 		}
@@ -443,7 +543,14 @@ const methods = {
 	sim_info: {
 		call: function() {
 			const idx = getModemIndex();
-			const out = exec("mmcli -i " + idx + " 2>&1");
+			if (!idx)
+				return { ok: false, error: "未找到 Modem" };
+			// SIM 与 modem 编号各自独立，重枚举后会分叉；用 -K 取 SIM 真实路径（字符串解析，不依赖 json）
+			const mj = execm("mmcli -m " + idx + " -K 2>&1", 8);
+			const sim = firstMatch(mj, /modem\.generic\.sim\s*:\s*(\S+)/);
+			if (!sim)
+				return { ok: false, error: "无法获取 SIM 路径" };
+			const out = execm("mmcli -i " + sim + " 2>&1", 10);
 			const g = function(re) {
 				let m = match(out, re);
 				return m ? trim(m[1]) : "";
@@ -487,7 +594,7 @@ const methods = {
 			const host = trim(request.args.host || "");
 			if (!match(host, /^[0-9.]{7,15}$/) && !match(host, /^[a-zA-Z0-9.-]{1,63}$/))
 				return { ok: false, error: "目标格式非法" };
-			const out = exec("ping -c 4 -W 2 " + host + " 2>&1");
+			const out = execm("ping -c 4 -W 2 -I wwan0 " + host + " 2>&1", 15);
 			const stats = match(out, /(\d+) packets transmitted, (\d+) packets received, (\d+)% packet loss/);
 			if (!stats)
 				return { ok: false, error: "Ping 执行失败" };
@@ -519,6 +626,9 @@ const methods = {
 			let allowed = false;
 			for (let c in white)
 				if (c == cmd) allowed = true;
+			// 动态上下文 id（CGCONTRDP/CGPADDR 的 cid 可为 1-9，白名单不再写死 5）
+			if (!allowed && match(cmd, /^AT\+CGCONTRDP=[1-9]$|^AT\+CGPADDR=[1-9]$/))
+				allowed = true;
 			if (!allowed)
 				return { ok: false, error: "仅允许预设只读查询指令" };
 			const out = exec("sh /usr/bin/m5g-at.sh '" + cmd + "' 2>&1");
@@ -529,20 +639,93 @@ const methods = {
 	// 只读：模块温度（AT+temp? 解析 TSENS）
 	temp: {
 		call: function() {
-			const out = exec("sh /usr/bin/m5g-at.sh 'AT+temp?' 2>&1");
-			const m = match(out, /TSENS:\s*(\d+)C/);
+			const out = exec("sh /usr/bin/m5g-at.sh 'AT+temp?' cache 2>&1");
+			const m = match(out, /TSENS:\s*(\d+)\s*C?/);
 			return { ok: !!m, tsens: m ? m[1] : "", output: trim(out) };
 		}
 	},
-	// 控制：延迟自动切回 5G（后台脚本，收信模式兜底；关页面也会执行）
+	// 只读：趋势数据（/tmp/m5g-trend.csv 尾部 N 条：ts,rsrp,snr,tsens,rx+tx）
+	trend: {
+		args: { n: "" },
+		call: function(request) {
+			const n = int(request.args.n || "120");
+			const out = exec("tail -n " + n + " /tmp/m5g-trend.csv 2>/dev/null");
+			const lines = split(trim(out), "\n");
+			const arr = [];
+			for (let l in lines) {
+				const p = split(l, ",");
+				if (length(p) >= 5 && p[0] != "#ts") {
+					push(arr, { t: p[0], rsrp: p[1], snr: p[2], tsens: p[3], rt: p[4] });
+				}
+			}
+			return { points: arr };
+		}
+	},
+	// 只读：实时速率（看门狗趋势缓存最后两点算，避免在 rpcd 内 sleep 阻塞整个 ubus 队列）
+	// 说明：趋势 CSV 存的是 rx+tx 合计计数（rt 字段），故返回合计速率
+	speed: {
+		call: function() {
+			const tail = exec("tail -n 2 /tmp/m5g-trend.csv 2>/dev/null");
+			const lines = split(trim(tail), "\n");
+			let mbps = 0;
+			if (length(lines) >= 2) {
+				const a = split(lines[0], ",");
+				const b = split(lines[1], ",");
+				if (length(a) >= 5 && length(b) >= 5 && a[0] != "#ts" && b[0] != "#ts") {
+					const dt = (int(b[0]) - int(a[0])) || 60;
+					const dr = int(b[4]) - int(a[4]);
+					if (dr >= 0 && dt > 0)
+						mbps = dr * 8 / dt / 1000000;
+				}
+			}
+			return { ok: true, dl_mbps: sprintf("%.2f", mbps), ul_mbps: sprintf("%.2f", mbps),
+				dl: sprintf("%.2f", mbps), ul: sprintf("%.2f", mbps) };
+		}
+	},
+	// 控制：一键诊断（action=start 后台生成 / action=get 读取报告）
+	diagnostic: {
+		args: { action: "" },
+		call: function(request) {
+			const action = trim(request.args.action || "start");
+			if (action == "start") {
+				exec("sh /usr/bin/m5g-diag.sh >/dev/null 2>&1 &");
+				return { ok: true, detail: "诊断开始，约 60 秒完成" };
+			}
+			if (action == "get") {
+				const out = exec("cat /tmp/m5g-diag.txt 2>/dev/null");
+				return { ok: !!match(out, /诊断报告/), output: trim(out) || "报告生成中，请稍后…" };
+			}
+			return { ok: false, error: "action 参数非法" };
+		}
+	},
+	// 控制：延迟自动恢复原制式（收信/发短信后端兜底；恢复的是切 4G 前记录的原制式）
 	auto_back: {
 		args: { seconds: "" },
 		call: function(request) {
 			const seconds = trim(request.args.seconds || "");
 			if (!match(seconds, /^[0-9]{1,4}$/))
 				return { ok: false, error: "秒数非法" };
+			if (seconds == "0") {
+				// 取消定时 + 立即恢复切换前记录的原制式（记录无效/被污染时回退默认 3g|4g|5g/5g）
+				exec("touch /tmp/m5g-smsback.cancel");
+				exec("rmdir /tmp/m5g-smsback.lock 2>/dev/null");
+				const idx = getModemIndex();
+				let a = trim(exec("sed -n '1p' /tmp/m5g-mode-before 2>/dev/null"));
+				let p = trim(exec("sed -n '2p' /tmp/m5g-mode-before 2>/dev/null"));
+				if (!a || match(a, /null/) || !match(a, /^[A-Za-z0-9|]+$/)) a = "3g|4g|5g";
+				if (!p || !match(p, /^[A-Za-z0-9]+$/)) p = "5g";
+				if (idx) {
+					let cmd = "mmcli -m " + idx + " --set-allowed-modes=\"" + a + "\"";
+					if (p) cmd += " --set-preferred-mode=\"" + p + "\"";
+					execm(cmd + " 2>&1", 20);
+				}
+				exec("rm -f /tmp/m5g-mode-before");
+				return { ok: true, detail: "已取消定时并恢复原制式" };
+			}
+			// 重新武装前清掉可能残留的取消标记（否则新定时器一醒来就被取消）
+			exec("rm -f /tmp/m5g-smsback.cancel");
 			exec("sh /usr/bin/m5g-sms-back.sh " + seconds + " >/dev/null 2>&1 &");
-			return { ok: true, detail: "已设置 " + seconds + " 秒后自动切回 5G" };
+			return { ok: true, detail: "已设置 " + seconds + " 秒后自动恢复原制式" };
 		}
 	}
 };

@@ -24,6 +24,50 @@ const callUssd = rpc.declare({ object: 'modem5g', method: 'ussd_query', params: 
 const callWatchdog = rpc.declare({ object: 'modem5g', method: 'watchdog_status', expect: {} });
 const callAtCmd = rpc.declare({ object: 'modem5g', method: 'at_cmd', params: [ 'cmd' ], expect: {} });
 const callTemp = rpc.declare({ object: 'modem5g', method: 'temp', expect: {} });
+const callTrend = rpc.declare({ object: 'modem5g', method: 'trend', params: [ 'n' ], expect: {} });
+const callSpeed = rpc.declare({ object: 'modem5g', method: 'speed', expect: {} });
+const callDiag = rpc.declare({ object: 'modem5g', method: 'diagnostic', params: [ 'action' ], expect: {} });
+
+// 速率趋势：rt 累计差值 / 时间间隔 → Mbps（采样 60s）
+function trendRate(points) {
+	const out = [];
+	for (let i = 1; i < points.length; i++) {
+		const r1 = parseFloat(points[i - 1].rt);
+		const r2 = parseFloat(points[i].rt);
+		if (!isNaN(r1) && !isNaN(r2) && r2 >= r1) {
+			const dt = (parseFloat(points[i].t) - parseFloat(points[i - 1].t)) || 60;
+			out.push({ t: points[i].t, rate: (r2 - r1) * 8 / dt / 1e6 });
+		}
+	}
+	return out;
+}
+
+// SVG 趋势折线图（innerHTML 构造，LuCI E() 不处理 SVG 命名空间）
+function trendSvg(points, key, min, max, color, label, unit) {
+	const W = 430, H = 88;
+	const vals = [];
+	for (let i = 0; i < points.length; i++) {
+		const v = parseFloat(points[i][key]);
+		if (!isNaN(v)) vals.push(v);
+	}
+	if (vals.length < 2)
+		return '<div style="color:#888;padding:8px">数据采集中…（约每 1 分钟 1 点）</div>';
+	let minV = Math.min.apply(null, vals.concat([ min ]));
+	let maxV = Math.max.apply(null, vals.concat([ max ]));
+	const range = (maxV - minV) || 1;
+	const n = vals.length;
+	const x = function(i) { return 42 + (i / (n - 1)) * (W - 52); };
+	const y = function(v) { return 6 + (1 - (v - minV) / range) * (H - 14); };
+	let path = '';
+	for (let i = 0; i < n; i++)
+		path += (i ? 'L' : 'M') + x(i).toFixed(1) + ',' + y(vals[i]).toFixed(1) + ' ';
+	const last = vals[n - 1];
+	return '<svg width="' + W + '" height="' + H + '" style="display:block;background:#fff;border:1px solid #eee">'
+		+ '<path d="' + path + '" stroke="' + color + '" stroke-width="1.5" fill="none"/>'
+		+ '<text x="8" y="12" font-size="10" fill="' + color + '">' + label + ' 当前 ' + last.toFixed(1) + unit + '</text>'
+		+ '<text x="8" y="' + (H - 4) + '" font-size="9" fill="#aaa">范围 ' + minV.toFixed(0) + ' ~ ' + maxV.toFixed(0) + '</text>'
+		+ '</svg>';
+}
 
 function section(title, rows) {
 	const tbody = E('tbody', {});
@@ -114,11 +158,23 @@ return view.extend({
 					armed = false;
 					btnRedial.disabled = true;
 					btnRedial.firstChild.nodeValue = '重拨中…';
+					// 客户端守护：40s 未返回也恢复按钮（后端可能仍在执行）
+					const guard = setTimeout(function() {
+						btnRedial.disabled = false;
+						btnRedial.firstChild.nodeValue = '重拨数据面';
+						notify('⏳ 请求超时返回（后端可能仍在执行），稍后刷新状态');
+					}, 40000);
 					callRedial().then(function(r) {
+						clearTimeout(guard);
 						btnRedial.disabled = false;
 						btnRedial.firstChild.nodeValue = '重拨数据面';
 						notify(r.ok ? '✅ 重拨成功，新 IP：' + (r.ipv4 || '') : '⏳ ' + (r.detail || '重拨进行中'));
-						location.reload();
+						setTimeout(function() { location.reload(); }, 1500);
+					}).catch(function() {
+						clearTimeout(guard);
+						btnRedial.disabled = false;
+						btnRedial.firstChild.nodeValue = '重拨数据面';
+						notify('⏳ 请求失败，请重试');
 					});
 				}
 			}, [ '重拨数据面' ]);
@@ -141,7 +197,11 @@ return view.extend({
 						btnMode.disabled = false;
 						btnMode.firstChild.nodeValue = '应用';
 						notify(r.ok ? '✅ 网络制式已切换' : '❌ ' + (r.error || r.detail || '切换失败'));
-						if (r.ok) location.reload();
+						if (r.ok) setTimeout(function() { location.reload(); }, 1500);
+					}).catch(function() {
+						btnMode.disabled = false;
+						btnMode.firstChild.nodeValue = '应用';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '应用' ]);
@@ -157,7 +217,11 @@ return view.extend({
 						btnEnable.disabled = false;
 						btnEnable.firstChild.nodeValue = '启用模块';
 						notify(r.ok ? '✅ 模块已启用' : '❌ ' + (r.detail || '启用失败'));
-						location.reload();
+						setTimeout(function() { location.reload(); }, 1500);
+					}).catch(function() {
+						btnEnable.disabled = false;
+						btnEnable.firstChild.nodeValue = '启用模块';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '启用模块' ]);
@@ -185,7 +249,11 @@ return view.extend({
 						btnDisable.disabled = false;
 						btnDisable.firstChild.nodeValue = '禁用模块';
 						notify(r.ok ? '✅ 模块已禁用' : '❌ ' + (r.detail || '禁用失败'));
-						location.reload();
+						setTimeout(function() { location.reload(); }, 1500);
+					}).catch(function() {
+						btnDisable.disabled = false;
+						btnDisable.firstChild.nodeValue = '禁用模块';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '禁用模块' ]);
@@ -216,37 +284,86 @@ return view.extend({
 						btnReset.disabled = false;
 						btnReset.firstChild.nodeValue = '复位模块';
 						notify(r.ok ? '✅ ' + (r.detail || '复位命令已发送') : '❌ ' + (r.detail || '复位失败'));
-						if (r.ok) setTimeout(function() { location.reload(); }, 60000);
+						if (r.ok) {
+							// 轮询探测恢复，替代固定 60s 硬 reload（后台恢复最长约 100s）
+							let tries = 0;
+							const pt = setInterval(function() {
+								tries++;
+								callStatus().then(function(s2) {
+									if (s2 && s2.model && s2.wwan0_ipv4) {
+										clearInterval(pt);
+										notify('✅ 模块已恢复上网');
+										location.reload();
+									} else if (tries >= 8) {
+										clearInterval(pt);
+										notify('⏳ 复位仍在进行，可稍后手动刷新页面');
+									}
+								});
+							}, 15000);
+						}
+					}).catch(function() {
+						btnReset.disabled = false;
+						btnReset.firstChild.nodeValue = '复位模块';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '复位模块' ]);
 
-			// --- 频段锁定（预设组合） ---
+			// --- 频段锁定（按运营商区分：移动/电信/联通/广电） ---
 			const all5g = (info.ngran_bands || []).join('|');
-			const BAND_OPTS = [
-				{ label: '全频段（自动）', bands: 'any' },
-				{ label: '仅 5G（全部 n 频段）', bands: all5g },
-				{ label: '移动 5G（n28+n41+n79）', bands: 'ngran-28|ngran-41|ngran-79' },
-				{ label: '电信/联通 5G（n78）', bands: 'ngran-78' },
-				{ label: '移动 4G（B3+B8+B34+B39+B40+B41）', bands: 'eutran-3|eutran-8|eutran-34|eutran-39|eutran-40|eutran-41' }
+			const BAND_GROUPS = [
+				{ label: '自动', opts: [
+					{ label: '全频段（自动）', bands: 'any' }
+				]},
+				{ label: '5G 频段', opts: [
+					{ label: '5G 全网通（n1+n8+n28+n41+n78+n79）', bands: 'ngran-1|ngran-8|ngran-28|ngran-41|ngran-78|ngran-79' },
+					{ label: '移动 5G（n28+n41+n79）', bands: 'ngran-28|ngran-41|ngran-79' },
+					{ label: '电信 5G（n1+n78）', bands: 'ngran-1|ngran-78' },
+					{ label: '联通 5G（n1+n8+n78）', bands: 'ngran-1|ngran-8|ngran-78' },
+					{ label: '广电 5G（n28+n79）', bands: 'ngran-28|ngran-79' },
+					{ label: '仅 5G（模块全部 n 频段）', bands: all5g, empty: !all5g }
+				]},
+				{ label: '4G 频段', opts: [
+					{ label: '4G 全网通（B1+B3+B5+B8+B34+B38+B39+B40+B41）', bands: 'eutran-1|eutran-3|eutran-5|eutran-8|eutran-34|eutran-38|eutran-39|eutran-40|eutran-41' },
+					{ label: '移动 4G（B3+B8+B34+B38+B39+B40+B41）', bands: 'eutran-3|eutran-8|eutran-34|eutran-38|eutran-39|eutran-40|eutran-41' },
+					{ label: '电信 4G（B1+B3+B5+B8）', bands: 'eutran-1|eutran-3|eutran-5|eutran-8' },
+					{ label: '联通 4G（B1+B3+B8+B40）', bands: 'eutran-1|eutran-3|eutran-8|eutran-40' },
+					{ label: '广电 4G（B3+B8+B38+B39+B40）', bands: 'eutran-3|eutran-8|eutran-38|eutran-39|eutran-40' }
+				]},
+				{ label: '运营商全频（4G+5G）', opts: [
+					{ label: '移动全频', bands: 'eutran-3|eutran-8|eutran-34|eutran-38|eutran-39|eutran-40|eutran-41|ngran-28|ngran-41|ngran-79' },
+					{ label: '电信全频', bands: 'eutran-1|eutran-3|eutran-5|eutran-8|ngran-1|ngran-78' },
+					{ label: '联通全频', bands: 'eutran-1|eutran-3|eutran-8|eutran-40|ngran-1|ngran-8|ngran-78' },
+					{ label: '广电全频', bands: 'eutran-3|eutran-8|eutran-38|eutran-39|eutran-40|ngran-28|ngran-79' }
+				]}
 			];
 			const bandSel = E('select', { 'id': 'm5g-sel-bands', 'class': 'cbi-input-select' });
-			BAND_OPTS.forEach(function(o, i) {
-				bandSel.appendChild(E('option', { 'value': String(i) }, [ o.label ]));
+			BAND_GROUPS.forEach(function(g) {
+				const og = E('optgroup', { 'label': g.label });
+				g.opts.forEach(function(o) {
+					const opt = E('option', { 'value': o.bands }, [ o.label ]);
+					if (o.empty) opt.disabled = true;   // 模块无 n 频段时禁选，避免传空串报错
+					og.appendChild(opt);
+				});
+				bandSel.appendChild(og);
 			});
 			const nBands = (info.cur_bands || []).length;
 			const btnBands = E('button', {
 				'id': 'm5g-btn-bands',
 				'class': 'btn cbi-button-action',
 				'click': function() {
-					const o = BAND_OPTS[parseInt(bandSel.value)];
+					const bands = bandSel.value;
 					btnBands.disabled = true;
 					btnBands.firstChild.nodeValue = '应用中…';
-					callSetBands(o.bands).then(function(r) {
+					callSetBands(bands).then(function(r) {
 						btnBands.disabled = false;
 						btnBands.firstChild.nodeValue = '应用';
 						notify(r.ok ? '✅ ' + (r.detail || '频段已设置') : '❌ ' + (r.error || r.detail || '设置失败'));
-						if (r.ok) location.reload();
+						if (r.ok) setTimeout(function() { location.reload(); }, 1500);
+					}).catch(function() {
+						btnBands.disabled = false;
+						btnBands.firstChild.nodeValue = '应用';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '应用' ]);
@@ -300,8 +417,13 @@ return view.extend({
 					dom.content(scanTable, '');
 					callScan().then(function(r) {
 						scanStatusText.textContent = r.started ? '扫描已启动，约 60-90 秒…' : (r.detail || '');
+						if (r.started) notify('⚠️ 扫描期间网络会断开约 1-3 分钟（网络搜索需短暂离网）');
 						clearInterval(scanTimer);
 						scanTimer = setInterval(pollScan, 6000);
+					}).catch(function() {
+						btnScan.disabled = false;
+						btnScan.firstChild.nodeValue = '开始扫描';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '开始扫描' ]);
@@ -331,11 +453,23 @@ return view.extend({
 					if (!apn) { notify('⚠️ 请填写 APN'); return; }
 					btnSave.disabled = true;
 					btnSave.firstChild.nodeValue = '保存中…';
+					// 客户端守护：40s 未返回也恢复按钮（后端可能仍在重拨）
+					const guard = setTimeout(function() {
+						btnSave.disabled = false;
+						btnSave.firstChild.nodeValue = '保存并重拨';
+						notify('⏳ 请求超时返回（后端可能仍在重拨），稍后刷新状态');
+					}, 40000);
 					callSetApn(apn, userInput.value.trim(), passInput.value).then(function(r) {
+						clearTimeout(guard);
 						btnSave.disabled = false;
 						btnSave.firstChild.nodeValue = '保存并重拨';
 						notify(r.ok ? '✅ ' + (r.detail || 'APN 已更新') : '❌ ' + (r.error || '保存失败'));
-						location.reload();
+						setTimeout(function() { location.reload(); }, 1500);
+					}).catch(function() {
+						clearTimeout(guard);
+						btnSave.disabled = false;
+						btnSave.firstChild.nodeValue = '保存并重拨';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '保存并重拨' ]);
@@ -357,29 +491,22 @@ return view.extend({
 						notify(r.ok ? '✅ ' + r.detail : '❌ ' + (r.error || r.detail || '测试失败'));
 						if (r.ok)
 							pingResult.textContent = '发送 ' + r.sent + ' / 接收 ' + r.recv + ' / 最小 ' + (r.min || '—') + ' / 平均 ' + (r.avg || '—') + ' ms';
+					}).catch(function() {
+						btnPing.disabled = false;
+						btnPing.firstChild.nodeValue = '测试';
+						notify('❌ 请求失败，请重试');
 					});
 				}
 			}, [ '测试' ]);
 
 			// --- USSD 查询（余额/套餐；T99W368 模块可能不支持） ---
-			const ussdInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:150px', 'value': '*100#', 'placeholder': 'USSD 码如 *100#' });
-			const ussdResult = E('span', { 'class': 'cbi-section-descr' }, []);
+			// T99W368 固件实测不支持 USSD：功能置灰并标注（保留 CLI 调用能力）
+			const ussdInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:150px', 'value': '*100#', 'placeholder': 'USSD 码（T99W368 实测不支持）', 'disabled': 'disabled' });
+			const ussdResult = E('span', { 'class': 'cbi-section-descr' }, [ '该模块固件实测不支持 USSD 查询' ]);
 			const btnUssd = E('button', {
 				'class': 'btn cbi-button-action',
-				'click': function() {
-					const code = ussdInput.value.trim();
-					if (!code) { notify('⚠️ 请输入 USSD 码'); return; }
-					btnUssd.disabled = true;
-					btnUssd.firstChild.nodeValue = '查询中…';
-					ussdResult.textContent = '';
-					callUssd(code).then(function(r) {
-						btnUssd.disabled = false;
-						btnUssd.firstChild.nodeValue = '查询';
-						ussdResult.textContent = r.ok ? ('结果：' + (r.result || '已发起')) : '失败：' + (r.detail || '模块可能不支持 USSD');
-						notify(r.ok ? '✅ ' + (r.result || 'USSD 已发起') : '❌ ' + (r.detail || '查询失败'));
-					});
-				}
-			}, [ '查询' ]);
+				'disabled': 'disabled'
+			}, [ '不支持（已禁用）' ]);
 
 			// --- AT 查询（ADB 通道，预设只读指令） ---
 			const AT_OPTS = [
@@ -414,9 +541,45 @@ return view.extend({
 						btnAt.disabled = false;
 						btnAt.firstChild.nodeValue = '执行';
 						atResult.textContent = r.ok ? r.output : ('❌ ' + (r.error || r.output || '无响应'));
+					}).catch(function() {
+						btnAt.disabled = false;
+						btnAt.firstChild.nodeValue = '执行';
+						atResult.textContent = '❌ 请求失败，请重试';
 					});
 				}
 			}, [ '执行' ]);
+
+			// --- 一键诊断 ---
+			const diagPre = E('pre', { 'style': 'white-space:pre-wrap;background:#f5f5f5;border:1px solid #ddd;padding:8px;margin-top:6px;max-height:260px;overflow-y:auto;min-width:100%;box-sizing:border-box' }, [ '点击"生成报告"开始诊断（约 60 秒）' ]);
+			const btnDiag = E('button', {
+				'id': 'm5g-btn-diag',
+				'class': 'btn cbi-button-action',
+				'click': function() {
+					btnDiag.disabled = true;
+					btnDiag.firstChild.nodeValue = '诊断中…';
+					diagPre.textContent = '诊断进行中，约 60 秒…';
+					callDiag('start').then(function(r) {
+						notify(r.ok ? '✅ ' + r.detail : '❌ 启动失败');
+						let tries = 0;
+						const timer = setInterval(function() {
+							tries++;
+							callDiag('get').then(function(r2) {
+								if (r2.ok) {
+									clearInterval(timer);
+									btnDiag.disabled = false;
+									btnDiag.firstChild.nodeValue = '生成报告';
+									diagPre.textContent = r2.output;
+								} else if (tries >= 12) {
+									clearInterval(timer);
+									btnDiag.disabled = false;
+									btnDiag.firstChild.nodeValue = '生成报告';
+									diagPre.textContent = '报告生成超时，请重试';
+								}
+							});
+						}, 8000);
+					});
+				}
+			}, [ '生成报告' ]);
 
 			// 看门狗状态（异步加载；定义须在 ctrlSection 之前，因其被引用）
 			const watchdogNode = E('span', {}, [ '…' ]);
@@ -486,6 +649,13 @@ return view.extend({
 							E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, [ atSel, btnAt ]),
 							E('pre', { 'class': 'm5g-at-out', 'style': 'white-space:pre-wrap;background:#f5f5f5;border:1px solid #ddd;padding:8px;margin-top:6px;max-height:200px;overflow-y:auto;min-width:100%;box-sizing:border-box' }, [ atResult ])
 						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '一键诊断' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('div', { 'style': 'display:flex;gap:8px;align-items:center' }, [ btnDiag ]),
+							diagPre
+						])
 					])
 				]),
 				scanTable,
@@ -511,6 +681,8 @@ return view.extend({
 							callSmsDelete(s.index).then(function(r) {
 								notify(r.ok ? '✅ 短信已删除' : '❌ ' + (r.detail || '删除失败'));
 								refreshSms();
+							}).catch(function() {
+								notify('❌ 删除请求失败，请重试');
 							});
 						}
 					}, [ '删除' ]);
@@ -552,7 +724,7 @@ return view.extend({
 				'class': 'cbi-input-text', 'style': 'width:100%;height:64px;box-sizing:border-box',
 				'placeholder': '短信内容（≤500 字符，支持中文/长短信自动分片）'
 			});
-			// 发送短信：5G 下自动切 4G → 发送 → 自动切回 5G
+			// 发送短信：5G 下自动切 4G → 发送 → 后端定时恢复原制式（页面关闭也生效）
 			const btnSmsSend = E('button', {
 				'id': 'm5g-btn-smssend',
 				'class': 'btn cbi-button-action',
@@ -573,11 +745,11 @@ return view.extend({
 								textInput.value = '';
 								refreshSms();
 							}
-							// 若为自动切 4G 发送，2 秒后自动切回 5G
-							if (!in4g) {
-								notify('⏳ 发送完成，2 秒后自动切回 5G');
-								setTimeout(function() { callSetMode('3g|4g|5g', '5g'); }, 2000);
-							}
+							// 切回原制式由后端兜底完成（auto_back 已武装），不再用前端固定 2s
+						}).catch(function() {
+							btnSmsSend.disabled = false;
+							btnSmsSend.firstChild.nodeValue = '发送短信';
+							notify('❌ 请求失败，请重试');
 						});
 					};
 					if (in4g) {
@@ -591,14 +763,20 @@ return view.extend({
 								notify('❌ 切 4G 失败: ' + (r.error || r.detail || ''));
 								return;
 							}
-							notify('📥 已切 4G，10 秒后自动发送…');
+							// 后端兜底：25 秒后自动恢复切 4G 前记录的原制式（页面关闭也生效）
+							callAutoBack('25');
+							notify('📥 已切 4G，10 秒后自动发送；发送完成自动恢复原制式');
 							setTimeout(doSend, 10000);
+						}).catch(function() {
+							btnSmsSend.disabled = false;
+							btnSmsSend.firstChild.nodeValue = '发送短信';
+							notify('❌ 切 4G 请求失败，请重试');
 						});
 					}
 				}
 			}, [ '发送短信' ]);
 			const btnSmsRefresh = E('button', { 'class': 'btn', 'click': refreshSms }, [ '刷新' ]);
-			// 收信模式：切 4G 收信，120 秒后自动切回 5G；可手动提前切回
+			// 收信模式：切 4G 收信，120 秒后后端自动恢复原制式；可手动提前切回（auto_back 负责恢复）
 			const is4gMode = (info.cur_allowed === '4g');
 			let autoBackTimer = null;
 			const smsModeHint = E('span', { 'class': 'cbi-section-descr' }, []);
@@ -609,16 +787,20 @@ return view.extend({
 					btnSmsMode.disabled = true;
 					btnSmsMode.firstChild.nodeValue = '切换中…';
 					if (is4gMode) {
-						// 手动切回 5G
+						// 手动提前切回：取消后端定时 + 立即恢复切 4G 前记录的原制式
 						clearTimeout(autoBackTimer);
-						callSetMode('3g|4g|5g', '5g').then(function(r) {
+						callAutoBack('0').then(function(r) {
 							btnSmsMode.disabled = false;
 							btnSmsMode.firstChild.nodeValue = '切换 4G 收信';
-							notify(r.ok ? '✅ 已切回 5G 上网' : '❌ ' + (r.error || '切换失败'));
-							location.reload();
+							notify(r.ok ? '✅ ' + (r.detail || '已恢复原制式') : '❌ ' + (r.error || '切换失败'));
+							setTimeout(function() { location.reload(); }, 1500);
+						}).catch(function() {
+							btnSmsMode.disabled = false;
+							btnSmsMode.firstChild.nodeValue = '切换 4G 收信';
+							notify('❌ 请求失败，请重试');
 						});
 					} else {
-						// 切 4G 收信 + 120s 自动回 5G
+						// 切 4G 收信 + 后端 120s 自动恢复原制式（关页面也生效）
 						callSetMode('4g', '').then(function(r) {
 							btnSmsMode.disabled = false;
 							if (!r.ok) {
@@ -627,21 +809,24 @@ return view.extend({
 								return;
 							}
 							btnSmsMode.firstChild.nodeValue = '切回 5G 上网';
-							smsModeHint.textContent = '📥 4G 收信中，120 秒后自动切回 5G（可点按钮提前切回）';
+							smsModeHint.textContent = '📥 4G 收信中，120 秒后自动恢复原制式（可点按钮提前切回）';
 							clearTimeout(autoBackTimer);
-							callAutoBack('120');  // 后端兜底（关页面也会自动回 5G）
+							callAutoBack('120');  // 后端兜底，恢复切 4G 前记录的原制式
 							autoBackTimer = setTimeout(function() {
-								notify('⏳ 收信窗口结束，自动切回 5G');
-								callSetMode('3g|4g|5g', '5g');
-								setTimeout(function() { location.reload(); }, 15000);
+								notify('⏳ 收信窗口结束，后端已自动恢复原制式');
+								setTimeout(function() { location.reload(); }, 3000);
 							}, 120000);
 							refreshSms();
+						}).catch(function() {
+							btnSmsMode.disabled = false;
+							btnSmsMode.firstChild.nodeValue = '切换 4G 收信';
+							notify('❌ 切 4G 请求失败，请重试');
 						});
 					}
 				}
 			}, [ is4gMode ? '切回 5G 上网' : '切换 4G 收信' ]);
 			if (is4gMode)
-				smsModeHint.textContent = '📥 当前 4G（可收发短信），收完点按钮切回 5G 或等待自动切换';
+				smsModeHint.textContent = '📥 当前 4G（可收发短信），收完点按钮切回原制式或等待自动恢复';
 			// 短信区：默认折叠隐藏（防止短信内容/号码泄露，点击标题展开）
 			const smsSection = E('details', { 'class': 'cbi-section' }, [
 				E('summary', { 'style': 'cursor:pointer;font-weight:bold' }, [ '📩 短信功能（点击展开：收信模式 / 发送 / 收件箱）' ]),
@@ -688,6 +873,32 @@ return view.extend({
 			callTemp().then(function(r) {
 				tempNode.textContent = r.ok ? (r.tsens + '°C') : '—';
 			});
+			const speedNode = E('span', {}, [ '…' ]);
+			// 速率由趋势数据前端计算（避免每次 render 触发后端双采样，也不再把 2s sleep 留给 rpcd）
+			const updateSpeed = function(points) {
+				const rates = trendRate(points);
+				if (rates.length) {
+					const last = rates[rates.length - 1].rate;
+					speedNode.textContent = '合计 ' + last.toFixed(2) + ' Mbps（60s 均值）';
+				} else {
+					speedNode.textContent = '—';
+				}
+			};
+			const rsrpDiv = E('div', {});
+			const snrDiv = E('div', {});
+			const tempDiv = E('div', {});
+			const rateDiv = E('div', {});
+			callTrend('120').then(function(r) {
+				if (r && r.points && r.points.length) {
+					rsrpDiv.innerHTML = trendSvg(r.points, 'rsrp', -130, -60, '#e67e22', '5G RSRP', ' dBm');
+					snrDiv.innerHTML = trendSvg(r.points, 'snr', 0, 25, '#2980b9', 'SINR', ' dB');
+					tempDiv.innerHTML = trendSvg(r.points, 'tsens', 30, 90, '#e74c3c', '温度', '°C');
+					rateDiv.innerHTML = trendSvg(trendRate(r.points), 'rate', 0, 50, '#27ae60', '实时速率', ' Mbps');
+					updateSpeed(r.points);
+				} else {
+					rsrpDiv.textContent = '数据采集中…';
+				}
+			});
 			// 自动刷新开关（30 秒）
 			const autoChk = E('input', { 'type': 'checkbox', 'id': 'm5g-autorefresh' });
 			let arTimer = null;
@@ -727,11 +938,21 @@ return view.extend({
 						[ 'IPv4', info.wwan0_ipv4 ],
 						[ 'IPv6', info.wwan0_ipv6 ],
 						[ '本次会话流量', usageNode ],
+						[ '实时速率', speedNode ],
 						[ '主端口', info.primary_port ],
 						[ '端口布局', info.ports ]
 					])
 				]),
 				ctrlSection,
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, [ '信号 / 温度 / 速率趋势（最近 2 小时，每分钟采样）' ]),
+					E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:12px' }, [
+						E('div', {}, [ rsrpDiv ]),
+						E('div', {}, [ snrDiv ]),
+						E('div', {}, [ tempDiv ]),
+						E('div', {}, [ rateDiv ])
+					])
+				]),
 				smsSection,
 				E('p', { 'class': 'cbi-section-descr' },
 					[ '数据更新于 ' + new Date(info.ts * 1000).toLocaleTimeString() ]),
