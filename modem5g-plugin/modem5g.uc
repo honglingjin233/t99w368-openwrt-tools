@@ -200,6 +200,16 @@ function scanState() {
 	return { state: "idle" };
 }
 
+// 多模组适配表（v4 新增）：MM 通用能力对任意 MBIM 模组生效；AT 增强层按模组分发
+const MODULE_ADAPTERS = {
+	"T99W368": { ifname: "wwan0", temp_cmd: "AT+temp?", model_re: /TSENS/ },
+	"FM350-GL": { ifname: "wwan0", temp_cmd: "AT+QTEMP?", model_re: /QTEMP/ },
+	"RM500Q-CN": { ifname: "wwan0", temp_cmd: "AT+QTEMP?", model_re: /QTEMP/ }
+};
+function adapterFor(model) {
+	return MODULE_ADAPTERS[model] || MODULE_ADAPTERS["T99W368"];
+}
+
 const methods = {
 	// 只读：5G 模块整体状态
 	status: {
@@ -636,12 +646,24 @@ const methods = {
 			return { ok: ok, output: trim(out) || "无响应（模块 AT 引擎可能忙）" };
 		}
 	},
-	// 只读：模块温度（AT+temp? 解析 TSENS）
+	// 只读：模块温度（v4 多模组分发：T99W368 用 AT+temp?；RM500/FM350 用 AT+QTEMP?）
 	temp: {
 		call: function() {
-			const out = exec("sh /usr/bin/m5g-at.sh 'AT+temp?' cache 2>&1");
-			const m = match(out, /TSENS:\s*(\d+)\s*C?/);
-			return { ok: !!m, tsens: m ? m[1] : "", output: trim(out) };
+			const idx = getModemIndex();
+			let model = "";
+			if (idx) {
+				let mo = execm("mmcli -m " + idx + " --output-json 2>&1", 6);
+				try {
+					let mj = json(mo);
+					model = (mj && mj.modem && mj.modem.generic && mj.modem.generic["model"]) || "";
+				} catch (e) {}
+			}
+			const cmd = match(model, /RM500|FM350/) ? "AT+QTEMP?" : "AT+temp?";
+			const out = exec("sh /usr/bin/m5g-at.sh '" + cmd + "' cache 2>&1");
+			let m = match(out, /TSENS:\s*(\d+)\s*C?/);
+			if (!m) m = match(out, /QTEMP[:\s]*([\d,]+)/);
+			if (!m) m = match(out, /(\d+)\s*C/);
+			return { ok: !!m, tsens: m ? m[1] : "", output: trim(out), model: model, cmd: cmd };
 		}
 	},
 	// 只读：趋势数据（/tmp/m5g-trend.csv 尾部 N 条：ts,rsrp,snr,tsens,rx+tx）
@@ -726,6 +748,240 @@ const methods = {
 			exec("rm -f /tmp/m5g-smsback.cancel");
 			exec("sh /usr/bin/m5g-sms-back.sh " + seconds + " >/dev/null 2>&1 &");
 			return { ok: true, detail: "已设置 " + seconds + " 秒后自动恢复原制式" };
+		}
+	},
+	// ============ v4 新增：看门狗开关 ============
+	watchdog_set: {
+		args: { action: "" },
+		call: function(request) {
+			const action = trim(request.args.action || "status");
+			if (action == "status") {
+				const pid = trim(exec("cat /tmp/m5g-watchdog.pid 2>/dev/null"));
+				const alive = pid && trim(exec("kill -0 " + pid + " 2>/dev/null && echo 1"));
+				return { running: !!alive, pid: pid || "" };
+			}
+			if (action == "start") {
+				const pid = trim(exec("cat /tmp/m5g-watchdog.pid 2>/dev/null"));
+				const alive = pid && trim(exec("kill -0 " + pid + " 2>/dev/null && echo 1"));
+				if (alive)
+					return { ok: true, detail: "看门狗已在运行" };
+				exec("setsid sh /usr/bin/m5g-watchdog.sh >/dev/null 2>&1 < /dev/null &");
+				exec("grep -q m5g-watchdog /etc/rc.local 2>/dev/null || sed -i '/exit 0/i setsid sh /usr/bin/m5g-watchdog.sh >/dev/null 2>&1 &' /etc/rc.local");
+				return { ok: true, detail: "看门狗已启动并写入开机自启" };
+			}
+			if (action == "stop") {
+				const pid = trim(exec("cat /tmp/m5g-watchdog.pid 2>/dev/null"));
+				if (pid)
+					exec("kill " + pid + " 2>/dev/null");
+				exec("sed -i '/m5g-watchdog/d' /etc/rc.local");
+				exec("rm -f /tmp/m5g-watchdog.pid");
+				return { ok: true, detail: "看门狗已停止并移除开机自启" };
+			}
+			return { ok: false, error: "action 非法(start/stop/status)" };
+		}
+	},
+	// ============ v4 新增：断网事件时间线 ============
+	watchdog_log: {
+		args: { n: "" },
+		call: function(request) {
+			const n = int(request.args.n || "30");
+			const out = exec("tail -n " + n + " /tmp/m5g-watchdog.log 2>/dev/null");
+			const evts = [];
+			for (let line in split(trim(out), "\n")) {
+				let m = match(line, /^(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(.*)$/);
+				if (m) {
+					let type = "info";
+					const msg = m[2];
+					if (match(msg, /重拨|假连接|无 IP/)) type = "redial";
+					else if (match(msg, /disabled|自动启用/)) type = "enable";
+					else if (match(msg, /ModemManager|无 modem/)) type = "mm";
+					push(evts, { time: m[1], msg: msg, type: type });
+				}
+			}
+			const rev = [];
+			for (let i = length(evts) - 1; i >= 0; i--)
+				push(rev, evts[i]);
+			return { events: rev, count: length(rev) };
+		}
+	},
+	// ============ v4 新增：信号硬核指标（MM 信号 + 今日趋势统计）============
+	deep_signal: {
+		call: function() {
+			try {
+			const idx = getModemIndex();
+			const info = mmStatus(idx);
+			// ucode 无 Array.filter（实测）→ 手写过滤出 5G NR 频段
+			const rawBands = info["cur_bands"] || [];
+			const bands = [];
+			for (let b in rawBands)
+				if (match(b, /^ngran-/))
+					push(bands, b);
+			const t0 = trim(exec("date +%s -d \"$(date +%F)\" 2>/dev/null")) || "0";
+			const stat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $2!=\"--\" && $2!=\"\" {n++; s+=$2; if(n==1||$2>mx)mx=$2; if(n==1||$2<mn)mn=$2} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
+			const sp = split(trim(stat), " ");
+			const tstat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $4!=\"--\" && $4!=\"\" {n++; s+=$4; if(n==1||$4>mx)mx=$4; if(n==1||$4<mn)mn=$4} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
+			const tp = split(trim(tstat), " ");
+			return {
+				tech: info["access_tech"] || "",
+				bands: bands,
+				signal_5g: { rsrp: info["signal_5g_rsrp"] || "", rsrq: info["signal_5g_rsrq"] || "", snr: info["signal_5g_snr"] || "" },
+				signal_lte: { rsrp: info["signal_lte_rsrp"] || "", snr: info["signal_lte_snr"] || "" },
+				today_rsrp: { min: sp[0] || "--", max: sp[1] || "--", avg: sp[2] || "--" },
+				today_tsens: { min: tp[0] || "--", max: tp[1] || "--", avg: tp[2] || "--" }
+			};
+			} catch (e) {
+				return { tech: "", bands: [], signal_5g: {}, signal_lte: {}, today_rsrp: {}, today_tsens: {}, error: "异常: " + e };
+			}
+		}
+	},
+	// ============ v4 新增：智能选网（信号阈值切换，默认关）============
+	signal_guard: {
+		args: { action: "", enabled: "", threshold: "" },
+		call: function(request) {
+			const action = trim(request.args.action || "get");
+			if (action == "get") {
+				const en = trim(exec("uci get modem5g.guard.enabled 2>/dev/null"));
+				const th = trim(exec("uci get modem5g.guard.threshold 2>/dev/null"));
+				const cd = trim(exec("uci get modem5g.guard.cooldown 2>/dev/null"));
+				return { enabled: (en == "1"), threshold: th || "-110", cooldown: cd || "600" };
+			}
+			if (action == "set") {
+				const enabled = trim(request.args.enabled || "");
+				const threshold = trim(request.args.threshold || "");
+				if (enabled == "1") {
+					if (!match(threshold, /^-[0-9]{1,3}$/))
+						return { ok: false, error: "阈值格式非法（如 -110）" };
+					const t = int(threshold);
+					if (t > -80 || t < -130)
+						return { ok: false, error: "阈值应在 -130 ~ -80 之间" };
+					exec("uci set modem5g.guard.enabled='1'");
+					exec("uci set modem5g.guard.threshold='" + threshold + "'");
+					exec("uci commit modem5g");
+					exec("setsid sh /usr/bin/m5g-signal-guard.sh >/dev/null 2>&1 < /dev/null &");
+					return { ok: true, detail: "智能选网已开启：5G RSRP < " + threshold + " dBm 连续 3 次自动切 4G，10 分钟后尝试恢复 5G" };
+				}
+				exec("uci set modem5g.guard.enabled='0'");
+				exec("uci commit modem5g");
+				const pid = trim(exec("cat /tmp/m5g-signal-guard.pid 2>/dev/null"));
+				if (pid)
+					exec("kill " + pid + " 2>/dev/null");
+				exec("rm -f /tmp/m5g-signal-guard.pid");
+				return { ok: true, detail: "智能选网已关闭（恢复手动制式配置）" };
+			}
+			return { ok: false, error: "action 非法(get/set)" };
+		}
+	},
+	// ============ v4 新增：月度流量统计 ============
+	traffic_stats: {
+		call: function() {
+			try {
+			const out = exec("cat /tmp/m5g-traffic.log 2>/dev/null");
+			const days = [];
+			for (let line in split(trim(out), "\n")) {
+				if (match(line, /^#/))
+					continue;
+				const p = split(line, " ");
+				if (length(p) >= 5 && match(p[0], /^\d{4}-\d{2}-\d{2}$/)) {
+					const brx = int(p[1]), btx = int(p[2]), crx = int(p[3]), ctx = int(p[4]);
+					const rx = crx > brx ? crx - brx : 0;
+					const tx = ctx > btx ? ctx - btx : 0;
+					push(days, { day: p[0], rx: rx, tx: tx, total: rx + tx });
+				}
+			}
+			const ym = trim(exec("date +%Y-%m"));
+			let monthTotal = 0;
+			for (let d in days) {
+				const dp = split(d.day, "-");
+				if (length(dp) >= 2 && (dp[0] + "-" + dp[1]) == ym)
+					monthTotal += d.total;
+			}
+			const today = length(days) ? days[length(days) - 1].day : "";
+			return { days: days, month_total: monthTotal, today: today, running: !!trim(exec("kill -0 $(cat /tmp/m5g-traffic.pid 2>/dev/null) 2>/dev/null && echo 1")) };
+			} catch (e) {
+				return { days: [], month_total: 0, today: "", running: false, error: "异常: " + e };
+			}
+		}
+	},
+	// ============ v4 新增：一键网络体检 ============
+	health_check: {
+		call: function() {
+			try {
+			const items = [];
+			const add = function(name, ok, detail) { push(items, { name: name, ok: ok, detail: detail }); };
+			const ip = firstMatch(exec("ip addr show wwan0 2>/dev/null") || "", /inet\s+([0-9.]+)/);
+			add("数据面接口", !!ip, ip ? ("wwan0 = " + ip) : "wwan0 无 IPv4 地址");
+			const gw = firstMatch(exec("ip route 2>/dev/null | grep wwan0 | grep default") || "", /default via (\S+)/);
+			if (gw) {
+				const gp = exec("ping -c 2 -W 2 " + gw + " 2>&1") || "";
+				add("网关连通", !!match(gp, /1 packets received|2 packets received/), "网关 " + gw);
+			} else {
+				add("网关连通", false, "未找到 wwan0 默认网关");
+			}
+			const pp = exec("ping -c 3 -W 2 -I wwan0 223.5.5.5 2>&1") || "";
+			const ps = match(pp, /(\d+) packets transmitted, (\d+) received/);
+			add("公网连通(223.5.5.5)", ps ? int(ps[2]) > 0 : false, ps ? (ps[1] + " 发 / " + ps[2] + " 收") : trim(split(pp, "\n")[0]));
+			const dn = exec("nslookup www.baidu.com 2>&1") || "";
+			add("DNS 解析", !!match(dn, /Address/), match(dn, /Address/) ? "www.baidu.com 解析成功" : "解析失败");
+			const mt = exec("ping -c 1 -W 2 -s 1450 -M do -I wwan0 223.5.5.5 2>&1") || "";
+			const mtOk = !!match(mt, /1 packets received|bytes from/);
+			add("MTU 1450 探测", mtOk, mtOk ? "可通过（数据面可承载 1450B 报文）" : "1450 过大或不支持 -M（可接受，不影响上网）");
+			let okCount = 0;
+			for (let i in items)
+				if (i.ok) okCount++;
+			return { items: items, ok_count: okCount, total: length(items), summary: okCount + " / " + length(items) + " 项通过" };
+			} catch (e) {
+				return { items: [], ok_count: 0, total: 0, summary: "异常: " + e };
+			}
+		}
+	},
+	// ============ v4 新增：LED 状态联动 ============
+	list_leds: {
+		call: function() {
+			const out = exec("ls /sys/class/leds/ 2>/dev/null");
+			const leds = [];
+			for (let l in split(trim(out), "\n"))
+				if (trim(l)) push(leds, trim(l));
+			const cur = trim(exec("uci get modem5g.led.name 2>/dev/null"));
+			const en = trim(exec("uci get modem5g.led.enabled 2>/dev/null"));
+			return { leds: leds, current: cur || "", enabled: (en == "1") };
+		}
+	},
+	led_map: {
+		args: { led: "", enabled: "" },
+		call: function(request) {
+			const led = trim(request.args.led || "");
+			const enabled = trim(request.args.enabled || "");
+			if (!match(led, /^[a-zA-Z0-9:_-]{1,64}$/))
+				return { ok: false, error: "LED 名称非法" };
+			exec("uci set modem5g.led.name='" + led + "'");
+			exec("uci set modem5g.led.enabled='" + (enabled == "1" ? "1" : "0") + "'");
+			exec("uci commit modem5g");
+			if (enabled == "1") {
+				exec("setsid sh /usr/bin/m5g-led.sh >/dev/null 2>&1 < /dev/null &");
+				return { ok: true, detail: "LED 联动已开启（" + led + " 亮=已连接）" };
+			}
+			const pid = trim(exec("cat /tmp/m5g-led.pid 2>/dev/null"));
+			if (pid)
+				exec("kill " + pid + " 2>/dev/null");
+			exec("rm -f /tmp/m5g-led.pid");
+			exec("echo 0 > /sys/class/leds/" + led + "/brightness 2>/dev/null");
+			return { ok: true, detail: "LED 联动已关闭" };
+		}
+	},
+	// ============ v4 新增：多模组适配信息 ============
+	module_profile: {
+		call: function() {
+			const idx = getModemIndex();
+			const info = mmStatus(idx);
+			const model = info["model"] || "";
+			const ad = adapterFor(model);
+			return {
+				model: model,
+				adapter: MODULE_ADAPTERS[model] ? ("内置适配器（" + model + "）") : "回退默认（T99W368 适配）",
+				temp_cmd: ad.temp_cmd,
+				ifname: ad.ifname,
+				note: "状态/拨号/短信走 ModemManager 通用层（任意 MBIM 模组）；温度/AT 增强层按模组分发"
+			};
 		}
 	}
 };

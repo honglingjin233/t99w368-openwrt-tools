@@ -4,6 +4,31 @@
 'require ui';
 'require dom';
 
+// =====================================================================
+// modem5g-status.js 重构版 v4.1（2026-09-10）
+// v4.1 真机页面优化（ACL 修复后实测）：
+//  V1 信号无效值（RSRP<=-140）判定为「无锚点」（不误导为差）；LTE 行注明 NSA 正常
+//  V2 5G RSRQ 模块未上报时显示「N/A（未上报）」而非裸 --
+//  V3 自动刷新默认开启，勾选状态 localStorage 记忆
+//  V4 页面标题动态显示实际模组型号（适配多模组）
+//  V5 窄屏(≤720px)三卡单栏堆叠；69 个频段 chips 默认收起到 16 个+展开按钮
+//  V6 看门狗事件时间线默认最近 5 条+展开全部（折叠区不再过长）
+//  V7 信号强度行合并显示 RSRP（44%（RSRP -89 dBm））
+// 布局改动（对应审查报告 P1-P9 / F1 / F5）：
+//  P1 控制区拆为「网络配置 / 操作 / 诊断工具」三组，诊断工具默认折叠
+//  P2 危险操作（禁用/复位）红色常驻 + 后果文案 + 双重确认
+//  P3 信号质量评级（RSRP/SINR 分级色标）
+//  P4 IMEI/ICCID/IMSI 默认掩码，点击显示
+//  P5 当前频段 chip 展示 + 频段下拉
+//  P6 自动刷新改为局部刷新（仅重拉 status，不整页 reload）
+//  P7 顶部异常横幅（模块禁用/未注册/数据面未附着/无IP/看门狗停止）
+//  P8 控制行统一 flex-wrap 移动端适配
+//  P9 端口信息移入诊断工具区；更新时间移近顶部
+//  F1 APN 运营商预设下拉
+//  F5 一键诊断报告下载
+//  F2 看门狗管理：UI 预留（需后端新增 watchdog_set 方法后方可启用）
+// =====================================================================
+
 const callStatus = rpc.declare({ object: 'modem5g', method: 'status', expect: {} });
 const callRedial = rpc.declare({ object: 'modem5g', method: 'redial', expect: {} });
 const callSetApn = rpc.declare({ object: 'modem5g', method: 'set_apn', params: [ 'apn', 'user', 'password' ], expect: {} });
@@ -27,6 +52,16 @@ const callTemp = rpc.declare({ object: 'modem5g', method: 'temp', expect: {} });
 const callTrend = rpc.declare({ object: 'modem5g', method: 'trend', params: [ 'n' ], expect: {} });
 const callSpeed = rpc.declare({ object: 'modem5g', method: 'speed', expect: {} });
 const callDiag = rpc.declare({ object: 'modem5g', method: 'diagnostic', params: [ 'action' ], expect: {} });
+// v4 新增
+const callWatchdogSet = rpc.declare({ object: 'modem5g', method: 'watchdog_set', params: [ 'action' ], expect: {} });
+const callWatchdogLog = rpc.declare({ object: 'modem5g', method: 'watchdog_log', params: [ 'n' ], expect: {} });
+const callDeepSignal = rpc.declare({ object: 'modem5g', method: 'deep_signal', expect: {} });
+const callSignalGuard = rpc.declare({ object: 'modem5g', method: 'signal_guard', params: [ 'action', 'enabled', 'threshold' ], expect: {} });
+const callTrafficStats = rpc.declare({ object: 'modem5g', method: 'traffic_stats', expect: {} });
+const callHealthCheck = rpc.declare({ object: 'modem5g', method: 'health_check', expect: {} });
+const callListLeds = rpc.declare({ object: 'modem5g', method: 'list_leds', expect: {} });
+const callLedMap = rpc.declare({ object: 'modem5g', method: 'led_map', params: [ 'led', 'enabled' ], expect: {} });
+const callModuleProfile = rpc.declare({ object: 'modem5g', method: 'module_profile', expect: {} });
 
 // 速率趋势：rt 累计差值 / 时间间隔 → Mbps（采样 60s）
 function trendRate(points) {
@@ -97,7 +132,71 @@ const MFG_CN = { 'QCOM': '高通 (Qualcomm)' };
 const SMS_STATE_CN = { 'received': '已接收', 'sent': '已发送', 'stored': '已存储', 'draft': '草稿', 'pending': '发送中', 'unknown': '未知' };
 const cn = function(map, v) { return (v && map[v]) ? map[v] : v; };
 
-// 制式选项（单制式只支持 preferred: none，带 preferred 的必须是组合制式）
+// ===== P3 信号质量评级 =====
+const SIG_COLORS = { '优': '#52C41A', '良': '#FAAD14', '差': '#EA6668' };
+function sigRating(rsrpStr, snrStr) {
+	const rsrp = parseFloat(rsrpStr), snr = parseFloat(snrStr);
+	if (isNaN(rsrp)) return { label: '', color: '' };
+	// 无效信号值（如 NSA 无 LTE 锚点时 MM 报 -156/-140 下限）：不参与优/良/差评级
+	if (rsrp <= -140) return { label: '无锚点', color: '#8b8b8b' };
+	let label = '差', color = SIG_COLORS['差'];
+	if (rsrp >= -95) { label = '优'; color = SIG_COLORS['优']; }
+	else if (rsrp >= -110) { label = '良'; color = SIG_COLORS['良']; }
+	if (!isNaN(snr) && snr >= 5 && rsrp >= -95) { label = '优'; color = SIG_COLORS['优']; }
+	else if (!isNaN(snr) && snr >= 5 && rsrp >= -110) { label = '良'; color = SIG_COLORS['良']; }
+	return { label: label, color: color };
+}
+function sigNode(rsrpStr, snrStr) {
+	const r = sigRating(rsrpStr, snrStr);
+	if (!r.label) return null;
+	return E('span', { 'style': 'display:inline-block;background:' + r.color + '22;color:' + r.color + ';border:1px solid ' + r.color + '55;border-radius:4px;padding:0 6px;margin-left:6px;font-size:11px' }, [ r.label ]);
+}
+
+// ===== P4 敏感信息掩码（与 MCP 侧策略一致：前6******后3）=====
+function maskId(v) {
+	if (!v) return '—';
+	if (String(v).length > 12) return String(v).slice(0, 6) + '******' + String(v).slice(-3);
+	return String(v);
+}
+function maskedNode(value) {
+	const node = E('span', { 'style': 'cursor:pointer;border-bottom:1px dashed #999', 'title': '点击显示/隐藏' }, [ maskId(value) ]);
+	let shown = false;
+	node.addEventListener('click', function() {
+		shown = !shown;
+		node.textContent = shown ? value : maskId(value);
+	});
+	return node;
+}
+
+// ===== P5 频段 chip 展示（v4.1：默认收起，展开按钮）=====
+function bandChips(bands, limit) {
+	const all = (bands || []);
+	const wrap = E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;align-items:center' });
+	function chip(b) {
+		const label = String(b).replace(/^ngran-/, 'n').replace(/^eutran-/, 'B').replace(/^utran-/, 'U');
+		return E('span', { 'style': 'display:inline-block;background:#E4E3DD;border-radius:4px;padding:1px 8px;font-size:11px;color:#333' }, [ label ]);
+	}
+	if (!all.length) {
+		wrap.appendChild(E('span', { 'style': 'color:#888;font-size:11px' }, [ '无（自动）' ]));
+		return wrap;
+	}
+	const showAll = (limit && all.length > limit);
+	(showAll ? all.slice(0, limit) : all).forEach(function(b) { wrap.appendChild(chip(b)); });
+	if (showAll) {
+		const rest = E('span', { 'style': 'display:none' });
+		all.slice(limit).forEach(function(b) { rest.appendChild(chip(b)); });
+		wrap.appendChild(rest);
+		const btn = E('button', { 'class': 'btn', 'style': 'padding:0 8px;font-size:11px;margin-left:4px' }, [ '展开全部 ' + all.length + ' 个' ]);
+		btn.addEventListener('click', function() {
+			rest.style.display = 'inline';
+			btn.style.display = 'none';
+		});
+		wrap.appendChild(btn);
+	}
+	return wrap;
+}
+
+// ===== 制式选项 =====
 const MODE_OPTS = [
 	{ label: '3G+4G+5G（默认）', allowed: '3g|4g|5g', preferred: '5g' },
 	{ label: '4G+5G', allowed: '4g|5g', preferred: '5g' },
@@ -113,6 +212,21 @@ function curModeKey(allowed) {
 	return -1;
 }
 
+// ===== F1 APN 运营商预设 =====
+const APN_PRESETS = [
+	{ label: '自定义…', apn: '', user: '', pass: '' },
+	{ label: '中国移动 cmnet', apn: 'cmnet' },
+	{ label: '中国移动 cmwap', apn: 'cmwap' },
+	{ label: '中国联通 3gnet', apn: '3gnet' },
+	{ label: '中国联通 wonet', apn: 'wonet' },
+	{ label: '中国电信 ctlte', apn: 'ctlte' },
+	{ label: '中国广电 10099', apn: '10099' }
+];
+
+// ===== 控制行通用样式（P8 移动端）=====
+const rowFlex = 'display:flex;gap:8px;flex-wrap:wrap;align-items:center';
+const selStyle = 'min-width:0;max-width:100%';
+
 return view.extend({
 	render: function() {
 		return callStatus().then(function(info) {
@@ -127,13 +241,43 @@ return view.extend({
 			const sig = info.signal ? info.signal + '%' : '—';
 			const has5gSig = info.signal_5g_rsrp && info.signal_5g_rsrp !== '--';
 			const hasLteSig = info.signal_lte_rsrp && info.signal_lte_rsrp !== '--';
-			const sigNode = E('span', {}, [ sig ]);
-			const sig5gNode = E('span', {}, [
-				has5gSig ? E('small', {}, [ 'RSRP ' + info.signal_5g_rsrp + ' dBm / SINR ' + info.signal_5g_snr + ' dB' ]) : '—'
+			const sigNode5g = E('span', {}, [
+				has5gSig ? E('span', {}, [ 'RSRP ' + info.signal_5g_rsrp + ' dBm / SINR ' + info.signal_5g_snr + ' dB' ]) : '—',
+				has5gSig ? sigNode(info.signal_5g_rsrp, info.signal_5g_snr) : null
 			]);
-			const sigLteNode = E('span', {}, [
-				hasLteSig ? E('small', {}, [ 'RSRP ' + info.signal_lte_rsrp + ' dBm / SINR ' + info.signal_lte_snr + ' dB' ]) : '—'
+			const sigNodeLte = E('span', {}, [
+				hasLteSig ? E('span', {}, [ 'RSRP ' + info.signal_lte_rsrp + ' dBm / SINR ' + info.signal_lte_snr + ' dB',
+					(parseFloat(info.signal_lte_rsrp) <= -140) ? E('span', { 'style': 'color:#888;font-size:11px' }, [ '（无 LTE 锚点，NSA 正常）' ]) : null ]) : '—',
+				hasLteSig ? sigNode(info.signal_lte_rsrp, info.signal_lte_snr) : null
 			]);
+
+			// ===== P7 异常横幅（顶部）=====
+			const bannerBox = E('div', { 'style': 'display:flex;flex-direction:column;gap:6px;margin-bottom:12px' });
+			function pushBanner(cls, text) {
+				bannerBox.appendChild(E('div', { 'class': cls, 'style': 'margin-bottom:0' }, [ text ]));
+			}
+			if (info.state === 'disabled') {
+				pushBanner('alert-message', '⚠ 模块已禁用（启用后数据面恢复）');
+			} else if (!stateOk) {
+				pushBanner('alert-message', '⚠ 模块状态异常：' + (cn(STATE_CN, info.state) || info.state));
+			}
+			if (info.registration && info.registration === 'searching')
+				pushBanner('alert-message', '⚠ 正在搜索网络…');
+			if (info.registration === 'denied')
+				pushBanner('alert-message', '⚠ 网络注册被拒绝（检查 SIM 卡/套餐/锁网）');
+			if (info.packet_state && info.packet_state !== 'attached' && info.registration === 'home' && stateOk)
+				pushBanner('alert-message', '⚠ 数据面未附着（数据包服务不可用）');
+			if (stateOk && !info.wwan0_ipv4)
+				pushBanner('alert-message', '⚠ 数据面无 IPv4 地址（可尝试重拨）');
+
+			// ===== 看门狗（异步，用于横幅 + 诊断区）=====
+			const watchdogNode = E('span', {}, [ '…' ]);
+			callWatchdog().then(function(r) {
+				const firstLog = (r.recent && r.recent !== '暂无重拨记录') ? r.recent.split('\n')[0] : '';
+				watchdogNode.textContent = (r.running ? '✅ 运行中' : '⚠ 未运行') + (firstLog ? '（最近自动重拨：' + firstLog + '）' : '');
+				if (!r.running)
+					pushBanner('alert-message', '⚠ 数据面看门狗未运行（建议在 rc.local 启用，防止假连接/断线无人重拨）');
+			});
 
 			// ===== 控制操作区 =====
 
@@ -158,7 +302,6 @@ return view.extend({
 					armed = false;
 					btnRedial.disabled = true;
 					btnRedial.firstChild.nodeValue = '重拨中…';
-					// 客户端守护：40s 未返回也恢复按钮（后端可能仍在执行）
 					const guard = setTimeout(function() {
 						btnRedial.disabled = false;
 						btnRedial.firstChild.nodeValue = '重拨数据面';
@@ -180,7 +323,7 @@ return view.extend({
 			}, [ '重拨数据面' ]);
 
 			// --- 网络制式下拉 + 应用 ---
-			const selMode = E('select', { 'class': 'cbi-input-select' });
+			const selMode = E('select', { 'class': 'cbi-input-select', 'style': selStyle });
 			MODE_OPTS.forEach(function(o, i) {
 				selMode.appendChild(E('option', { 'value': String(i) }, [ o.label ]));
 			});
@@ -227,18 +370,20 @@ return view.extend({
 			}, [ '启用模块' ]);
 			let dArm = false, dTimer = null;
 			const btnDisable = E('button', {
-				'class': 'btn cbi-button-action',
+				// P2 危险按钮：红色常驻 + 后果文案
+				'class': 'btn cbi-button-negative',
+				'style': 'font-weight:600',
 				'click': function() {
 					if (!dArm) {
 						dArm = true;
-						btnDisable.classList.add('cbi-button-negative');
+						btnDisable.style.opacity = '0.6';
 						btnDisable.firstChild.nodeValue = '再次点击确认禁用';
-						notify('⚠️ 禁用会断开 5G，再次点击确认');
+						notify('⚠️ 禁用会断开 5G（数据面中断，重拨后恢复），再次点击确认');
 						dTimer = setTimeout(function() {
 							dArm = false;
-							btnDisable.classList.remove('cbi-button-negative');
-							btnDisable.firstChild.nodeValue = '禁用模块';
-						}, 4000);
+							btnDisable.style.opacity = '1';
+							btnDisable.firstChild.nodeValue = '禁用模块（断开 5G）';
+						}, 5000);
 						return;
 					}
 					clearTimeout(dTimer);
@@ -247,33 +392,34 @@ return view.extend({
 					btnDisable.firstChild.nodeValue = '禁用中…';
 					callDisable().then(function(r) {
 						btnDisable.disabled = false;
-						btnDisable.firstChild.nodeValue = '禁用模块';
+						btnDisable.firstChild.nodeValue = '禁用模块（断开 5G）';
 						notify(r.ok ? '✅ 模块已禁用' : '❌ ' + (r.detail || '禁用失败'));
 						setTimeout(function() { location.reload(); }, 1500);
 					}).catch(function() {
 						btnDisable.disabled = false;
-						btnDisable.firstChild.nodeValue = '禁用模块';
+						btnDisable.firstChild.nodeValue = '禁用模块（断开 5G）';
 						notify('❌ 请求失败，请重试');
 					});
 				}
-			}, [ '禁用模块' ]);
+			}, [ '禁用模块（断开 5G）' ]);
 			const moduleBtns = moduleDisabled ? [ btnEnable ] : [ btnDisable ];
 
-			// --- 模块复位（两次点击确认） ---
+			// --- 模块复位（P2 红色常驻 + 双重确认） ---
 			let rArm = false, rTimer = null;
 			const btnReset = E('button', {
-				'class': 'btn cbi-button-action',
+				'class': 'btn cbi-button-negative',
+				'style': 'font-weight:600',
 				'click': function() {
 					if (!rArm) {
 						rArm = true;
-						btnReset.classList.add('cbi-button-negative');
+						btnReset.style.opacity = '0.6';
 						btnReset.firstChild.nodeValue = '再次点击确认复位';
-						notify('⚠️ 模块复位将断开 5G 约 30-60 秒，再次点击确认');
+						notify('⚠️ 模块复位将断开 5G 约 30-60 秒（自动恢复上网），再次点击确认');
 						rTimer = setTimeout(function() {
 							rArm = false;
-							btnReset.classList.remove('cbi-button-negative');
-							btnReset.firstChild.nodeValue = '复位模块';
-						}, 4000);
+							btnReset.style.opacity = '1';
+							btnReset.firstChild.nodeValue = '复位模块（断网约 1 分钟）';
+						}, 5000);
 						return;
 					}
 					clearTimeout(rTimer);
@@ -282,10 +428,9 @@ return view.extend({
 					btnReset.firstChild.nodeValue = '复位中…';
 					callReset().then(function(r) {
 						btnReset.disabled = false;
-						btnReset.firstChild.nodeValue = '复位模块';
+						btnReset.firstChild.nodeValue = '复位模块（断网约 1 分钟）';
 						notify(r.ok ? '✅ ' + (r.detail || '复位命令已发送') : '❌ ' + (r.detail || '复位失败'));
 						if (r.ok) {
-							// 轮询探测恢复，替代固定 60s 硬 reload（后台恢复最长约 100s）
 							let tries = 0;
 							const pt = setInterval(function() {
 								tries++;
@@ -303,18 +448,16 @@ return view.extend({
 						}
 					}).catch(function() {
 						btnReset.disabled = false;
-						btnReset.firstChild.nodeValue = '复位模块';
+						btnReset.firstChild.nodeValue = '复位模块（断网约 1 分钟）';
 						notify('❌ 请求失败，请重试');
 					});
 				}
-			}, [ '复位模块' ]);
+			}, [ '复位模块（断网约 1 分钟）' ]);
 
-			// --- 频段锁定（按运营商区分：移动/电信/联通/广电） ---
+			// --- 频段锁定（P5：当前频段 chip + 按运营商分组下拉） ---
 			const all5g = (info.ngran_bands || []).join('|');
 			const BAND_GROUPS = [
-				{ label: '自动', opts: [
-					{ label: '全频段（自动）', bands: 'any' }
-				]},
+				{ label: '自动', opts: [ { label: '全频段（自动）', bands: 'any' } ] },
 				{ label: '5G 频段', opts: [
 					{ label: '5G 全网通（n1+n8+n28+n41+n78+n79）', bands: 'ngran-1|ngran-8|ngran-28|ngran-41|ngran-78|ngran-79' },
 					{ label: '移动 5G（n28+n41+n79）', bands: 'ngran-28|ngran-41|ngran-79' },
@@ -337,12 +480,12 @@ return view.extend({
 					{ label: '广电全频', bands: 'eutran-3|eutran-8|eutran-38|eutran-39|eutran-40|ngran-28|ngran-79' }
 				]}
 			];
-			const bandSel = E('select', { 'id': 'm5g-sel-bands', 'class': 'cbi-input-select' });
+			const bandSel = E('select', { 'id': 'm5g-sel-bands', 'class': 'cbi-input-select', 'style': selStyle });
 			BAND_GROUPS.forEach(function(g) {
 				const og = E('optgroup', { 'label': g.label });
 				g.opts.forEach(function(o) {
 					const opt = E('option', { 'value': o.bands }, [ o.label ]);
-					if (o.empty) opt.disabled = true;   // 模块无 n 频段时禁选，避免传空串报错
+					if (o.empty) opt.disabled = true;
 					og.appendChild(opt);
 				});
 				bandSel.appendChild(og);
@@ -437,15 +580,25 @@ return view.extend({
 				renderScanResult(info);
 			}
 
-			// --- APN 表单 ---
+			// --- APN 表单（F1 预设下拉 + 原表单） ---
 			const apnInput = E('input', {
 				'class': 'cbi-input-text',
-				'style': 'width:220px',
+				'style': 'width:200px;min-width:0',
 				'placeholder': 'APN，如 cmnet',
 				'value': info.cfg_apn || ''
 			});
-			const userInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:130px', 'placeholder': '用户名（可选）' });
-			const passInput = E('input', { 'class': 'cbi-input-text', 'type': 'password', 'style': 'width:130px', 'placeholder': '密码（可选）' });
+			const userInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:120px;min-width:0', 'placeholder': '用户名（可选）' });
+			const passInput = E('input', { 'class': 'cbi-input-text', 'type': 'password', 'style': 'width:120px;min-width:0', 'placeholder': '密码（可选）' });
+			const apnPreset = E('select', { 'class': 'cbi-input-select', 'style': selStyle });
+			APN_PRESETS.forEach(function(p, i) {
+				apnPreset.appendChild(E('option', { 'value': String(i) }, [ p.label ]));
+			});
+			apnPreset.addEventListener('change', function() {
+				const p = APN_PRESETS[parseInt(apnPreset.value)];
+				if (p.apn) apnInput.value = p.apn;
+				userInput.value = p.user || '';
+				passInput.value = p.pass || '';
+			});
 			const btnSave = E('button', {
 				'class': 'btn cbi-button-action',
 				'click': function() {
@@ -453,7 +606,6 @@ return view.extend({
 					if (!apn) { notify('⚠️ 请填写 APN'); return; }
 					btnSave.disabled = true;
 					btnSave.firstChild.nodeValue = '保存中…';
-					// 客户端守护：40s 未返回也恢复按钮（后端可能仍在重拨）
 					const guard = setTimeout(function() {
 						btnSave.disabled = false;
 						btnSave.firstChild.nodeValue = '保存并重拨';
@@ -474,8 +626,42 @@ return view.extend({
 				}
 			}, [ '保存并重拨' ]);
 
+			// ===== 智能选网（v4：信号阈值切换，默认关 + 风险提示）=====
+			const guardState = E('span', { 'style': 'font-size:12px;color:#666' }, [ '…' ]);
+			const guardThreshold = E('select', { 'class': 'cbi-input-select', 'style': selStyle });
+			[ '-95', '-100', '-105', '-110', '-115', '-120' ].forEach(function(t) {
+				guardThreshold.appendChild(E('option', { 'value': t }, [ t + ' dBm' ]));
+			});
+			const guardChk = E('input', { 'type': 'checkbox', 'id': 'm5g-guard' });
+			guardChk.addEventListener('change', function() {
+				guardChk.disabled = true;
+				const en = guardChk.checked ? '1' : '0';
+				const th = guardThreshold.value;
+				if (en === '1' && !confirm('⚠ 开启智能选网：5G 信号弱于阈值时模块将自动切换到 4G（10 分钟后尝试恢复 5G）。\n确认开启？')) {
+					guardChk.checked = false;
+					guardChk.disabled = false;
+					return;
+				}
+				callSignalGuard('set', en, th).then(function(r) {
+					guardChk.disabled = false;
+					notify(r.ok ? '✅ ' + (r.detail || '已设置') : '❌ ' + (r.error || r.detail || '设置失败'));
+					if (r.ok) guardState.textContent = en === '1' ? '已开启' : '已关闭';
+				}).catch(function() {
+					guardChk.disabled = false;
+					notify('❌ 请求失败，请重试');
+				});
+			});
+			callSignalGuard('get', '', '').then(function(r) {
+				if (!r) return;
+				guardChk.checked = !!r.enabled;
+				guardState.textContent = r.enabled ? '已开启（弱信号自动切 4G）' : '已关闭';
+				if (r.threshold) guardThreshold.value = String(r.threshold);
+			});
+
+			// ===== 诊断工具区（P1/P9 折叠区）=====
+
 			// --- 网络诊断 Ping ---
-			const pingInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:150px', 'value': '223.5.5.5', 'placeholder': '目标 IP 或域名' });
+			const pingInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:150px;min-width:0', 'value': '223.5.5.5', 'placeholder': '目标 IP 或域名' });
 			const pingResult = E('span', { 'class': 'cbi-section-descr' }, []);
 			const btnPing = E('button', {
 				'class': 'btn cbi-button-action',
@@ -499,16 +685,12 @@ return view.extend({
 				}
 			}, [ '测试' ]);
 
-			// --- USSD 查询（余额/套餐；T99W368 模块可能不支持） ---
-			// T99W368 固件实测不支持 USSD：功能置灰并标注（保留 CLI 调用能力）
+			// --- USSD（T99W368 实测不支持，置灰） ---
 			const ussdInput = E('input', { 'class': 'cbi-input-text', 'style': 'width:150px', 'value': '*100#', 'placeholder': 'USSD 码（T99W368 实测不支持）', 'disabled': 'disabled' });
 			const ussdResult = E('span', { 'class': 'cbi-section-descr' }, [ '该模块固件实测不支持 USSD 查询' ]);
-			const btnUssd = E('button', {
-				'class': 'btn cbi-button-action',
-				'disabled': 'disabled'
-			}, [ '不支持（已禁用）' ]);
+			const btnUssd = E('button', { 'class': 'btn cbi-button-action', 'disabled': 'disabled' }, [ '不支持（已禁用）' ]);
 
-			// --- AT 查询（ADB 通道，预设只读指令） ---
+			// --- AT 查询（预设只读指令） ---
 			const AT_OPTS = [
 				{ label: 'ATI（模块信息/IMEI）', cmd: 'ATI' },
 				{ label: 'AT+COPS?（运营商/接入制式）', cmd: 'AT+COPS?' },
@@ -524,7 +706,7 @@ return view.extend({
 				{ label: 'AT+CGMR（固件版本）', cmd: 'AT+CGMR' },
 				{ label: 'AT+temp?（模块温度）', cmd: 'AT+temp?' }
 			];
-			const atSel = E('select', { 'id': 'm5g-sel-at', 'class': 'cbi-input-select' });
+			const atSel = E('select', { 'id': 'm5g-sel-at', 'class': 'cbi-input-select', 'style': selStyle });
 			AT_OPTS.forEach(function(o, i) {
 				atSel.appendChild(E('option', { 'value': String(i) }, [ o.label ]));
 			});
@@ -549,7 +731,7 @@ return view.extend({
 				}
 			}, [ '执行' ]);
 
-			// --- 一键诊断 ---
+			// --- 一键诊断（F5 加下载） ---
 			const diagPre = E('pre', { 'style': 'white-space:pre-wrap;background:#f5f5f5;border:1px solid #ddd;padding:8px;margin-top:6px;max-height:260px;overflow-y:auto;min-width:100%;box-sizing:border-box' }, [ '点击"生成报告"开始诊断（约 60 秒）' ]);
 			const btnDiag = E('button', {
 				'id': 'm5g-btn-diag',
@@ -580,90 +762,272 @@ return view.extend({
 					});
 				}
 			}, [ '生成报告' ]);
+			const btnDiagDl = E('button', {
+				'class': 'btn',
+				'click': function() {
+					const txt = diagPre.textContent || '';
+					if (!txt || /生成|诊断/.test(txt.slice(0, 12))) { notify('⚠️ 请先生成诊断报告'); return; }
+					try {
+						const blob = new Blob([ txt ], { 'type': 'text/plain' });
+						const a = document.createElement('a');
+						a.href = URL.createObjectURL(blob);
+						a.download = 'modem5g-diag-' + new Date().toISOString().slice(0, 10) + '.txt';
+						a.click();
+						setTimeout(function() { URL.revokeObjectURL(a.href); }, 2000);
+					} catch (e) {
+						notify('❌ 浏览器不支持下载，可手动复制');
+					}
+				}
+			}, [ '下载报告' ]);
 
-			// 看门狗状态（异步加载；定义须在 ctrlSection 之前，因其被引用）
-			const watchdogNode = E('span', {}, [ '…' ]);
-			callWatchdog().then(function(r) {
-				const firstLog = (r.recent && r.recent !== '暂无重拨记录') ? r.recent.split('\n')[0] : '';
-				watchdogNode.textContent = (r.running ? '✅ 运行中' : '⚠️ 未运行') + (firstLog ? '（最近自动重拨：' + firstLog + '）' : '');
-			});
+			// ===== 分区组装（P1）=====
 
+			// 网络配置区：制式 / 频段（含 chip）/ APN（含预设）
+			const cfgSection = E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ '网络配置' ]),
+				E('div', { 'class': 'cbi-map' }, [
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '网络制式' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('div', { 'style': rowFlex }, [ selMode, btnMode ]),
+							E('div', { 'style': 'margin-top:4px;font-size:12px;color:#666' },
+								[ '当前：' + (info.cur_allowed || '—') + '（优先 ' + (info.cur_preferred || '—') + '）' ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '频段锁定' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('div', { 'style': rowFlex }, [ bandSel, btnBands ]),
+							E('div', { 'style': 'margin-top:4px;font-size:12px;color:#666' },
+								[ '当前启用 ' + nBands + ' 个频段：' ]),
+							bandChips(info.cur_bands, 16)
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ 'APN 参数' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('div', { 'style': rowFlex }, [ apnPreset ]),
+							E('div', { 'style': rowFlex + ';margin-top:6px' }, [ apnInput, userInput, passInput, btnSave ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '智能选网（信号阈值切换）' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('div', { 'style': rowFlex }, [
+								E('label', { 'style': 'cursor:pointer' }, [ guardChk, ' 5G 信号弱时自动切 4G' ]),
+								' 阈值 ', guardThreshold
+							]),
+							E('div', { 'style': 'margin-top:4px' }, [ guardState ]),
+							E('div', { 'style': 'margin-top:4px;font-size:12px;color:#b02a2c' },
+								[ '⚠ 默认关闭；开启后模块制式由信号自动切换，冷却 10 分钟尝试恢复 5G。' ])
+						])
+					])
+				])
+			]);
+
+			// 操作区：数据面 / 扫描 / 电源（危险红色）
 			const ctrlSection = E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ '控制操作' ]),
+				E('h3', {}, [ '操作' ]),
 				E('div', { 'class': 'cbi-map' }, [
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, [ '数据面' ]),
 						E('div', { 'class': 'cbi-value-field' }, [ btnRedial ])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '网络制式' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('span', {}, [ '当前：' + (info.cur_allowed || '—') + '（优先 ' + (info.cur_preferred || '—') + '）' ]),
-							E('div', { 'style': 'display:flex;gap:8px;margin-top:6px' }, [ selMode, btnMode ])
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '频段锁定' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('span', {}, [ '当前启用 ' + nBands + ' 个频段' ]),
-							E('div', { 'style': 'display:flex;gap:8px;margin-top:6px' }, [ bandSel, btnBands ])
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '模块电源' ]),
-						E('div', { 'class': 'cbi-value-field' }, moduleBtns.concat([ btnReset ]))
-					]),
-					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, [ '网络扫描' ]),
+						E('div', { 'class': 'cbi-value-field' }, [ E('div', { 'style': rowFlex }, [ btnScan, scanStatusText ]) ])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '模块电源（危险操作）' ]),
+						E('div', { 'class': 'cbi-value-field' }, [ E('div', { 'style': rowFlex }, moduleBtns.concat([ btnReset ])) ])
+					])
+				]),
+				E('div', { 'class': 'cbi-section-descr' },
+					[ '⚠ 危险操作（红色按钮）会中断 5G 数据面：禁用需手动启用恢复；复位约 1 分钟后自动恢复。管理走有线 LAN 不受影响。' ])
+			]);
+
+			// ===== v4：看门狗开关 =====
+			const btnWd = E('button', {
+				'class': 'btn cbi-button-action',
+				'click': function() {
+					btnWd.disabled = true;
+					const act = (btnWd.firstChild.nodeValue === '启动看门狗') ? 'start' : 'stop';
+					btnWd.firstChild.nodeValue = '处理中…';
+					callWatchdogSet(act).then(function(r) {
+						btnWd.disabled = false;
+						notify(r.ok ? '✅ ' + (r.detail || '已执行') : '❌ ' + (r.error || r.detail || '执行失败'));
+						if (r.ok) {
+							btnWd.firstChild.nodeValue = (act === 'start') ? '停止看门狗' : '启动看门狗';
+							location.reload();
+						}
+					}).catch(function() {
+						btnWd.disabled = false;
+						btnWd.firstChild.nodeValue = (act === 'start') ? '停止看门狗' : '启动看门狗';
+						notify('❌ 请求失败，请重试');
+					});
+				}
+			}, [ '…' ]);
+			callWatchdogSet('status').then(function(r) {
+				if (!r) return;
+				btnWd.firstChild.nodeValue = r.running ? '停止看门狗' : '启动看门狗';
+			});
+			// ===== v4：断网事件时间线 =====
+			const wdLogTable = E('table', { 'class': 'cbi-section-table' });
+			const wdLogWrap = E('div', { 'style': 'max-height:220px;overflow-y:auto;margin-top:6px' }, [ wdLogTable ]);
+			const wdLogHint = E('span', { 'class': 'cbi-section-descr' }, []);
+			function renderWdLog(evts) {
+				if (!evts || !evts.length) {
+					dom.content(wdLogTable, E('tr', {}, [ E('td', {}, [ '暂无断网/重拨记录' ]) ]));
+					return;
+				}
+				const tbody = E('tbody', {});
+				evts.forEach(function(e) {
+					const cls = e.type === 'redial' ? 'cbi-status-failed' : (e.type === 'enable' ? 'cbi-status-ok' : '');
+					tbody.appendChild(E('tr', {}, [
+						E('td', { 'class': 'td left', 'style': 'white-space:nowrap' }, [ e.time || '—' ]),
+						E('td', { 'class': 'td left' }, [ E('span', { 'class': cls }, [ e.msg ]) ])
+					]));
+				});
+				dom.content(wdLogTable, tbody);
+			}
+			callWatchdogLog('30').then(function(r) {
+				wdLogHint.textContent = '最近 ' + (r && r.count ? r.count : 0) + ' 条事件（重拨/启用/MM 重启）';
+				const evts = (r && r.events) ? r.events : [];
+				renderWdLog(evts.slice(0, 5));
+				if (evts.length > 5) {
+					const btnMore = E('button', { 'class': 'btn', 'style': 'margin-top:6px;padding:0 10px;font-size:12px' }, [ '展开全部 ' + evts.length + ' 条' ]);
+					btnMore.addEventListener('click', function() {
+						renderWdLog(evts);
+						btnMore.style.display = 'none';
+					});
+					wdLogWrap.appendChild(btnMore);
+				}
+			});
+			// ===== v4：一键网络体检 =====
+			const hcTable = E('table', { 'class': 'cbi-section-table' });
+			const hcResult = E('span', { 'class': 'cbi-section-descr' }, []);
+			const btnHc = E('button', {
+				'class': 'btn cbi-button-action',
+				'click': function() {
+					btnHc.disabled = true;
+					btnHc.firstChild.nodeValue = '体检中（约 15 秒）…';
+					hcResult.textContent = '';
+					callHealthCheck().then(function(r) {
+						btnHc.disabled = false;
+						btnHc.firstChild.nodeValue = '一键体检';
+						hcResult.textContent = (r && r.summary) ? ('✅ ' + r.summary) : '执行失败';
+						if (r && r.items) {
+							const tbody = E('tbody', {});
+							r.items.forEach(function(it) {
+								tbody.appendChild(E('tr', {}, [
+									E('td', { 'class': 'td left' }, [ it.name ]),
+									E('td', { 'class': 'td left' }, [
+										E('span', { 'class': it.ok ? 'cbi-status-ok' : 'cbi-status-failed' }, [ it.ok ? '✓ 通过' : '✗ 失败' ]),
+										' ' + (it.detail || '')
+									])
+								]));
+							});
+							dom.content(hcTable, tbody);
+						}
+					}).catch(function() {
+						btnHc.disabled = false;
+						btnHc.firstChild.nodeValue = '一键体检';
+						notify('❌ 请求失败，请重试');
+					});
+				}
+			}, [ '一键体检' ]);
+			// ===== v4：LED 状态联动 =====
+			const ledSel = E('select', { 'class': 'cbi-input-select', 'style': selStyle });
+			const ledChk = E('input', { 'type': 'checkbox', 'id': 'm5g-led' });
+			const ledHint = E('span', { 'style': 'font-size:12px;color:#666' }, [ '…' ]);
+			ledChk.addEventListener('change', function() {
+				ledChk.disabled = true;
+				const en = ledChk.checked ? '1' : '0';
+				callLedMap(ledSel.value, en).then(function(r) {
+					ledChk.disabled = false;
+					notify(r.ok ? '✅ ' + (r.detail || '已设置') : '❌ ' + (r.error || r.detail || '设置失败'));
+					if (r.ok) ledHint.textContent = en === '1' ? '已开启（亮=已连接）' : '已关闭';
+				}).catch(function() {
+					ledChk.disabled = false;
+					notify('❌ 请求失败，请重试');
+				});
+			});
+			callListLeds().then(function(r) {
+				if (!r) return;
+				(r.leds || []).forEach(function(l) {
+					ledSel.appendChild(E('option', { 'value': l }, [ l ]));
+				});
+				if (r.current) ledSel.value = r.current;
+				ledChk.checked = !!r.enabled;
+				ledHint.textContent = r.enabled ? '已开启（亮=已连接）' : '已关闭';
+			});
+
+			// 诊断工具区（P1 折叠）
+			const diagSection = E('details', { 'class': 'cbi-section' }, [
+				E('summary', { 'style': 'cursor:pointer;font-weight:bold' }, [ '🔧 诊断工具（点击展开：看门狗 / Ping / USSD / AT 查询 / 一键诊断）' ]),
+				E('div', { 'style': 'margin-top:8px' }, [
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '数据面看门狗' ]),
 						E('div', { 'class': 'cbi-value-field' }, [
-							btnScan, ' ', scanStatusText
+							E('div', { 'style': rowFlex }, [ watchdogNode, btnWd ]),
+							E('div', { 'style': 'margin-top:6px' }, [ wdLogHint ]),
+							wdLogWrap
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ 'APN 参数' ]),
+						E('label', { 'class': 'cbi-value-title' }, [ '网络诊断 Ping' ]),
 						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap' }, [ apnInput, userInput, passInput, btnSave ])
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '网络诊断' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, [ pingInput, btnPing ]),
+							E('div', { 'style': rowFlex }, [ pingInput, btnPing ]),
 							E('div', { 'style': 'margin-top:6px' }, [ pingResult ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '一键网络体检（v4）' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('div', { 'style': rowFlex }, [ btnHc, hcResult ]),
+							E('div', { 'style': 'margin-top:6px' }, [ hcTable ])
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ 'LED 状态联动（v4）' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('div', { 'style': rowFlex }, [
+								E('label', { 'style': 'cursor:pointer' }, [ ledChk, ' 已连接时点亮' ]),
+								ledSel, ' ', ledHint
+							])
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, [ 'USSD 查询' ]),
 						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, [ ussdInput, btnUssd ]),
+							E('div', { 'style': rowFlex }, [ ussdInput, btnUssd ]),
 							E('div', { 'style': 'margin-top:6px' }, [ ussdResult ])
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '数据面看门狗' ]),
-						E('div', { 'class': 'cbi-value-field' }, [ watchdogNode ])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ 'AT 查询' ]),
+						E('label', { 'class': 'cbi-value-title' }, [ 'AT 查询（ADB 通道，预设只读指令）' ]),
 						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, [ atSel, btnAt ]),
-							E('pre', { 'class': 'm5g-at-out', 'style': 'white-space:pre-wrap;background:#f5f5f5;border:1px solid #ddd;padding:8px;margin-top:6px;max-height:200px;overflow-y:auto;min-width:100%;box-sizing:border-box' }, [ atResult ])
+							E('div', { 'style': rowFlex }, [ atSel, btnAt ]),
+							E('pre', { 'style': 'white-space:pre-wrap;background:#f5f5f5;border:1px solid #ddd;padding:8px;margin-top:6px;max-height:200px;overflow-y:auto;min-width:100%;box-sizing:border-box' }, [ atResult ])
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, [ '一键诊断' ]),
 						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': 'display:flex;gap:8px;align-items:center' }, [ btnDiag ]),
+							E('div', { 'style': rowFlex }, [ btnDiag, btnDiagDl ]),
 							diagPre
 						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ '端口信息（调试）' ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('span', {}, [ '主端口 ' + (info.primary_port || '—') + ' · ' + (info.ports || '—') ])
+						])
 					])
-				]),
-				scanTable,
-				E('div', { 'class': 'cbi-section-descr' },
-					[ '重拨/切制式/禁用会短暂断开数据面；管理走有线 LAN 不受影响。' ])
+				])
 			]);
 
-			// ===== 短信区 =====
+			// ===== 短信区（保留：折叠 + 懒加载）=====
 			const smsTable = E('table', { 'class': 'cbi-section-table' });
 			const smsTableWrap = E('div', { 'style': 'max-height:360px;overflow-y:auto' }, [ smsTable ]);
 			const smsStatus = E('span', { 'class': 'cbi-section-descr' }, [ '加载中…' ]);
@@ -686,7 +1050,6 @@ return view.extend({
 							});
 						}
 					}, [ '删除' ]);
-					// 内容默认折叠：显示摘要，点击展开/收起全文
 					const fullText = s.text || '—';
 					const shortText = fullText.length > 24 ? fullText.slice(0, 24) + '…' : fullText;
 					let smsExpanded = false;
@@ -717,14 +1080,13 @@ return view.extend({
 				});
 			}
 			const numInput = E('input', {
-				'class': 'cbi-input-text', 'style': 'width:220px',
+				'class': 'cbi-input-text', 'style': 'width:220px;min-width:0',
 				'placeholder': '接收号码，如 13800138000'
 			});
 			const textInput = E('textarea', {
 				'class': 'cbi-input-text', 'style': 'width:100%;height:64px;box-sizing:border-box',
 				'placeholder': '短信内容（≤500 字符，支持中文/长短信自动分片）'
 			});
-			// 发送短信：5G 下自动切 4G → 发送 → 后端定时恢复原制式（页面关闭也生效）
 			const btnSmsSend = E('button', {
 				'id': 'm5g-btn-smssend',
 				'class': 'btn cbi-button-action',
@@ -745,7 +1107,6 @@ return view.extend({
 								textInput.value = '';
 								refreshSms();
 							}
-							// 切回原制式由后端兜底完成（auto_back 已武装），不再用前端固定 2s
 						}).catch(function() {
 							btnSmsSend.disabled = false;
 							btnSmsSend.firstChild.nodeValue = '发送短信';
@@ -763,7 +1124,6 @@ return view.extend({
 								notify('❌ 切 4G 失败: ' + (r.error || r.detail || ''));
 								return;
 							}
-							// 后端兜底：25 秒后自动恢复切 4G 前记录的原制式（页面关闭也生效）
 							callAutoBack('25');
 							notify('📥 已切 4G，10 秒后自动发送；发送完成自动恢复原制式');
 							setTimeout(doSend, 10000);
@@ -776,7 +1136,6 @@ return view.extend({
 				}
 			}, [ '发送短信' ]);
 			const btnSmsRefresh = E('button', { 'class': 'btn', 'click': refreshSms }, [ '刷新' ]);
-			// 收信模式：切 4G 收信，120 秒后后端自动恢复原制式；可手动提前切回（auto_back 负责恢复）
 			const is4gMode = (info.cur_allowed === '4g');
 			let autoBackTimer = null;
 			const smsModeHint = E('span', { 'class': 'cbi-section-descr' }, []);
@@ -787,7 +1146,6 @@ return view.extend({
 					btnSmsMode.disabled = true;
 					btnSmsMode.firstChild.nodeValue = '切换中…';
 					if (is4gMode) {
-						// 手动提前切回：取消后端定时 + 立即恢复切 4G 前记录的原制式
 						clearTimeout(autoBackTimer);
 						callAutoBack('0').then(function(r) {
 							btnSmsMode.disabled = false;
@@ -800,7 +1158,6 @@ return view.extend({
 							notify('❌ 请求失败，请重试');
 						});
 					} else {
-						// 切 4G 收信 + 后端 120s 自动恢复原制式（关页面也生效）
 						callSetMode('4g', '').then(function(r) {
 							btnSmsMode.disabled = false;
 							if (!r.ok) {
@@ -811,7 +1168,7 @@ return view.extend({
 							btnSmsMode.firstChild.nodeValue = '切回 5G 上网';
 							smsModeHint.textContent = '📥 4G 收信中，120 秒后自动恢复原制式（可点按钮提前切回）';
 							clearTimeout(autoBackTimer);
-							callAutoBack('120');  // 后端兜底，恢复切 4G 前记录的原制式
+							callAutoBack('120');
 							autoBackTimer = setTimeout(function() {
 								notify('⏳ 收信窗口结束，后端已自动恢复原制式');
 								setTimeout(function() { location.reload(); }, 3000);
@@ -827,29 +1184,27 @@ return view.extend({
 			}, [ is4gMode ? '切回 5G 上网' : '切换 4G 收信' ]);
 			if (is4gMode)
 				smsModeHint.textContent = '📥 当前 4G（可收发短信），收完点按钮切回原制式或等待自动恢复';
-			// 短信区：默认折叠隐藏（防止短信内容/号码泄露，点击标题展开）
 			const smsSection = E('details', { 'class': 'cbi-section' }, [
 				E('summary', { 'style': 'cursor:pointer;font-weight:bold' }, [ '📩 短信功能（点击展开：收信模式 / 发送 / 收件箱）' ]),
 				E('div', { 'style': 'margin-top:8px' }, [
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, [ '收信模式' ]),
-						E('div', { 'class': 'cbi-value-field' }, [ btnSmsMode, ' ', smsModeHint ])
+						E('div', { 'class': 'cbi-value-field' }, [ E('div', { 'style': rowFlex }, [ btnSmsMode, smsModeHint ]) ])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, [ '发送短信' ]),
 						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, [ numInput, btnSmsSend ]),
+							E('div', { 'style': rowFlex }, [ numInput, btnSmsSend ]),
 							E('div', { 'style': 'margin-top:6px' }, [ textInput ])
 						])
 					]),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, [ '收件箱' ]),
-						E('div', { 'class': 'cbi-value-field' }, [ btnSmsRefresh, ' ', smsStatus ])
+						E('div', { 'class': 'cbi-value-field' }, [ E('div', { 'style': rowFlex }, [ btnSmsRefresh, smsStatus ]) ])
 					]),
 					smsTableWrap
 				])
 			]);
-			// 懒加载：首次展开短信区才拉取收件箱（默认折叠时 DOM 无短信数据，防泄露）
 			let smsLoaded = false;
 			smsSection.addEventListener('toggle', function() {
 				if (smsSection.open && !smsLoaded) {
@@ -858,7 +1213,7 @@ return view.extend({
 				}
 			});
 
-			// 数据用量 + SIM 详情（异步加载填充）
+			// ===== 数据用量 + SIM 详情（异步填充）=====
 			const usageNode = E('span', {}, [ '…' ]);
 			callUsage().then(function(r) {
 				usageNode.textContent = r.ok ? ('↓' + r.rx + ' ↑' + r.tx + '，共 ' + r.total) : '—';
@@ -866,15 +1221,73 @@ return view.extend({
 			const simIccidNode = E('span', {}, [ '…' ]);
 			const simImsiNode = E('span', {}, [ '…' ]);
 			callSimInfo().then(function(r) {
-				simIccidNode.textContent = r.iccid || '—';
-				simImsiNode.textContent = r.imsi || '—';
+				dom.content(simIccidNode, maskedNode(r.iccid));
+				dom.content(simImsiNode, maskedNode(r.imsi));
 			});
 			const tempNode = E('span', {}, [ '…' ]);
 			callTemp().then(function(r) {
 				tempNode.textContent = r.ok ? (r.tsens + '°C') : '—';
 			});
+			// v4：适配层信息（module_profile 异步）
+			const adapterNode = E('span', {}, [ '…' ]);
+			callModuleProfile().then(function(r) {
+				adapterNode.textContent = (r && r.adapter) ? r.adapter : '—';
+			});
+			// v4：本月流量（traffic_stats 异步）
+			const monthNode = E('span', {}, [ '…' ]);
+			function fmtTraffic(v) {
+				if (v >= 1073741824) return (v / 1073741824.0).toFixed(2) + ' GB';
+				if (v >= 1048576) return (v / 1048576.0).toFixed(1) + ' MB';
+				if (v >= 1024) return Math.round(v / 1024.0) + ' KB';
+				return v + ' B';
+			}
+			callTrafficStats().then(function(r) {
+				if (r && r.days && r.days.length)
+					monthNode.textContent = (r.month_total !== undefined ? ('本月 ' + fmtTraffic(r.month_total) + ' · ') : '') + '今日 ' + fmtTraffic(r.days[r.days.length - 1].total || 0);
+				else
+					monthNode.textContent = '统计中…（守护进程每分钟快照）';
+			});
+
+			// ===== P6 局部刷新（仅重拉 status，不整页 reload）=====
+			const updatableNodes = { state: stateBadge, sig: sigNode5g, lte: sigNodeLte };
+			const arKey = 'm5g-autorefresh';
+			let arTimer = null;
+			const autoChk = E('input', { 'type': 'checkbox', 'id': 'm5g-autorefresh' });
+			autoChk.checked = window.localStorage.getItem(arKey) !== '0';   // 默认开启
+			const startAr = function() {
+				if (arTimer) clearInterval(arTimer);
+				arTimer = setInterval(function() {
+					callStatus().then(function(s2) {
+						if (!s2 || !s2.model) return;
+						const ok2 = okStates.indexOf(s2.state) > -1;
+						updatableNodes.state.textContent = cn(STATE_CN, s2.state) || '未知';
+						updatableNodes.state.className = 'cbi-status-' + (ok2 ? 'ok' : 'failed');
+						updatableNodes.sig.firstChild.textContent = s2.signal_5g_rsrp && s2.signal_5g_rsrp !== '--'
+							? ('RSRP ' + s2.signal_5g_rsrp + ' dBm / SINR ' + s2.signal_5g_snr + ' dB') : '—';
+						updatableNodes.lte.firstChild.textContent = s2.signal_lte_rsrp && s2.signal_lte_rsrp !== '--'
+							? ('RSRP ' + s2.signal_lte_rsrp + ' dBm / SINR ' + s2.signal_lte_snr + ' dB') : '—';
+					});
+				}, 30000);
+			};
+			autoChk.addEventListener('change', function() {
+				if (autoChk.checked) {
+					window.localStorage.setItem(arKey, '1');
+					startAr();
+					notify('已开启自动刷新（每 30 秒局部更新状态）');
+				} else {
+					window.localStorage.setItem(arKey, '0');
+					clearInterval(arTimer);
+					arTimer = null;
+				}
+			});
+			if (autoChk.checked) startAr();
+
+			// ===== 趋势区（保留）=====
+			const rsrpDiv = E('div', {});
+			const snrDiv = E('div', {});
+			const tempDiv = E('div', {});
+			const rateDiv = E('div', {});
 			const speedNode = E('span', {}, [ '…' ]);
-			// 速率由趋势数据前端计算（避免每次 render 触发后端双采样，也不再把 2s sleep 留给 rpcd）
 			const updateSpeed = function(points) {
 				const rates = trendRate(points);
 				if (rates.length) {
@@ -884,10 +1297,6 @@ return view.extend({
 					speedNode.textContent = '—';
 				}
 			};
-			const rsrpDiv = E('div', {});
-			const snrDiv = E('div', {});
-			const tempDiv = E('div', {});
-			const rateDiv = E('div', {});
 			callTrend('120').then(function(r) {
 				if (r && r.points && r.points.length) {
 					rsrpDiv.innerHTML = trendSvg(r.points, 'rsrp', -130, -60, '#e67e22', '5G RSRP', ' dBm');
@@ -899,28 +1308,48 @@ return view.extend({
 					rsrpDiv.textContent = '数据采集中…';
 				}
 			});
-			// 自动刷新开关（30 秒）
-			const autoChk = E('input', { 'type': 'checkbox', 'id': 'm5g-autorefresh' });
-			let arTimer = null;
-			autoChk.addEventListener('change', function() {
-				if (autoChk.checked) {
-					notify('已开启自动刷新（每 30 秒自动刷新页面数据）');
-					arTimer = setInterval(function() { location.reload(); }, 30000);
-				} else {
-					clearInterval(arTimer);
-				}
+
+			// ===== v4：信号硬核指标（deep_signal）=====
+			const hardSigRows = [
+				[ '接入制式', '…' ], [ '支持频段（5G）', '…' ], [ '5G RSRP / RSRQ / SINR', '…' ],
+				[ 'LTE RSRP / SINR', '…' ], [ '今日 RSRP 最低/最高/平均', '…' ], [ '今日温度 最低/最高/平均', '…' ]
+			];
+			const hardSigTable = section('信号硬核指标（今日统计）', hardSigRows);
+			callDeepSignal().then(function(r) {
+				if (!r) return;
+				const cells = hardSigTable.querySelectorAll('td');
+				if (!cells || cells.length < 12) return;
+				cells[1].textContent = cn(TECH_CN, r.tech) || r.tech || '—';
+				cells[3].textContent = (r.bands || []).slice(0, 8).map(function(b) { return String(b).replace(/^ngran-/, 'n').replace(/^eutran-/, 'B'); }).join(', ') + ((r.bands || []).length > 8 ? ' 等 ' + r.bands.length + ' 个' : '') || '—';
+				cells[5].textContent = (r.signal_5g && r.signal_5g.rsrp) ? (r.signal_5g.rsrp + ' / ' + ((r.signal_5g.rsrq && r.signal_5g.rsrq !== '--') ? r.signal_5g.rsrq : 'N/A（未上报）') + ' / ' + r.signal_5g.snr + ' dB') : '—';
+				cells[7].textContent = (r.signal_lte && r.signal_lte.rsrp) ? (r.signal_lte.rsrp + ' / ' + r.signal_lte.snr + ' dB') : '—';
+				cells[9].textContent = (r.today_rsrp && r.today_rsrp.min !== '--') ? (r.today_rsrp.min + ' / ' + r.today_rsrp.max + ' / ' + r.today_rsrp.avg + ' dBm') : '数据采集中…';
+				cells[11].textContent = (r.today_tsens && r.today_tsens.min !== '--') ? (r.today_tsens.min + ' / ' + r.today_tsens.max + ' / ' + r.today_tsens.avg + ' °C') : '数据采集中…';
 			});
 
+			// ===== 组装（P9 更新时间置顶）=====
+			// 窄屏单栏：≤720px 时状态/信息/数据面三卡纵向堆叠
+			if (!document.getElementById('m5g-media-css')) {
+				const st = document.createElement('style');
+				st.id = 'm5g-media-css';
+				st.textContent = '@media (max-width:720px){ #m5g-status-grid{ grid-template-columns:1fr !important; } }';
+				document.head.appendChild(st);
+			}
+			const tsLine = E('p', { 'class': 'cbi-section-descr' },
+				[ '数据更新于 ' + new Date(info.ts * 1000).toLocaleTimeString(),
+					E('span', { 'style': 'margin-left:16px' }, [ autoChk, ' 自动刷新（30 秒，局部更新）' ]) ]);
+			function shortModel(m) { return m && m.length > 22 ? m.slice(0, 22) + '…' : (m || '未知模组'); }
+
 			return E('div', {}, [
-				E('h2', {}, [ '5G 模块状态', E('em', {}, [ ' · T99W368 (SDX65)' ]) ]),
-				// 信息区三卡并排（窄屏自动换行）
-				E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;align-items:start' }, [
+				E('h2', {}, [ '5G 模块状态', E('em', {}, [ ' · ' + shortModel(info.model) ]) ]),
+				bannerBox,
+				E('div', { 'id': 'm5g-status-grid', 'style': 'display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;align-items:start' }, [
 					section('连接状态', [
 						[ '模块状态', stateBadge ],
 						[ '接入技术', cn(TECH_CN, info.access_tech) || '—' ],
-						[ '信号强度', sigNode ],
-						[ '5G 载波信号', sig5gNode ],
-						[ 'LTE 锚点信号', sigLteNode ],
+						[ '信号强度', has5gSig ? (sig + '（RSRP ' + info.signal_5g_rsrp + ' dBm）') : sig ],
+						[ '5G 载波信号', sigNode5g ],
+						[ 'LTE 锚点信号', sigNodeLte ],
 						[ '运营商', (cn(OP_CN, info.operator_name) || info.operator_name || '—') + (info.operator_id ? ' (' + info.operator_id + ')' : '') ],
 						[ '注册状态', cn(REG_CN, info.registration) || '—' ],
 						[ '数据连接', cn(PACKET_CN, info.packet_state) || '—' ]
@@ -929,21 +1358,25 @@ return view.extend({
 						[ '厂商', cn(MFG_CN, info.manufacturer) || '—' ],
 						[ '型号', info.model ],
 						[ '固件版本', info.firmware ],
-						[ 'IMEI', info.imei ],
+						[ 'IMEI（点击显示）', maskedNode(info.imei) ],
 						[ 'SIM 卡号 ICCID', simIccidNode ],
 						[ 'SIM 识别码 IMSI', simImsiNode ],
-						[ '模块温度', tempNode ]
+						[ '模块温度', tempNode ],
+						[ '适配层', adapterNode ]
 					]),
 					section('数据面', [
 						[ 'IPv4', info.wwan0_ipv4 ],
 						[ 'IPv6', info.wwan0_ipv6 ],
 						[ '本次会话流量', usageNode ],
 						[ '实时速率', speedNode ],
-						[ '主端口', info.primary_port ],
-						[ '端口布局', info.ports ]
+						[ '月度流量', monthNode ]
 					])
 				]),
+				hardSigTable,
+				tsLine,
+				cfgSection,
 				ctrlSection,
+				diagSection,
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, [ '信号 / 温度 / 速率趋势（最近 2 小时，每分钟采样）' ]),
 					E('div', { 'style': 'display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:12px' }, [
@@ -954,9 +1387,7 @@ return view.extend({
 					])
 				]),
 				smsSection,
-				E('p', { 'class': 'cbi-section-descr' },
-					[ '数据更新于 ' + new Date(info.ts * 1000).toLocaleTimeString() ]),
-				E('p', { 'class': 'cbi-section-descr' }, [ autoChk, ' 自动刷新（30 秒）' ])
+				E('p', { 'class': 'cbi-section-descr' }, [ '提示：危险操作（禁用/复位）会中断 5G；短信收发需切 4G，发送后自动恢复原制式。' ])
 			]);
 		});
 	}

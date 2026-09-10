@@ -1,14 +1,14 @@
 {
 	"luci-app-modem5g": {
-		"description": "5G 模块状态只读访问（T99W368）",
+		"description": "5G 模块状态访问（T99W368，完整 v4 方法）",
 		"read": {
 			"ubus": {
-				"modem5g": [ "status", "list", "sms_list", "usage", "sim_info", "watchdog_status", "temp", "trend", "speed" ]
+				"modem5g": [ "status", "list", "sms_list", "usage", "sim_info", "watchdog_status", "temp", "trend", "speed", "deep_signal", "traffic_stats", "module_profile", "watchdog_log", "list_leds", "health_check" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"modem5g": [ "redial", "set_apn", "set_mode", "enable", "disable", "reset", "scan", "set_bands", "sms_send", "sms_delete", "auto_back", "ping_test", "ussd_query", "at_cmd", "diagnostic" ]
+				"modem5g": [ "redial", "set_apn", "set_mode", "enable", "disable", "reset", "scan", "set_bands", "sms_send", "sms_delete", "auto_back", "ping_test", "ussd_query", "at_cmd", "diagnostic", "watchdog_set", "signal_guard", "led_map" ]
 			}
 		}
 	}
