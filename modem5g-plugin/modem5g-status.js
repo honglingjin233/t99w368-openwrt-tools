@@ -5,7 +5,14 @@
 'require dom';
 
 // =====================================================================
-// modem5g-status.js 重构版 v4.1（2026-09-10）
+// modem5g-status.js 重构版 v4.2（2026-09-10）
+// v4.2 仪表盘化（参考 PrivateRouter/CleanX/5G CPE 首页布局共识）：
+//  V8 顶部 KPI 概览行：连接状态/信号强度/实时速率/今日流量/本月流量/模块温度 六卡大字置顶
+//  V9 网络配置折叠为「高级设置」（简单/高级视图，默认收起，减少日常噪音）
+//  V10 手动「立即刷新」按钮（自动刷新旁）
+//  V11 时间固定 24 小时制（不随浏览器 locale 变 AM/PM）
+//  V12 标题取型号短名（空格前段，如 SDXLEMUR-SD-MTP）
+//  V13 数据面卡补「数据面接口」行（module_profile.ifname），三卡底部对齐
 // v4.1 真机页面优化（ACL 修复后实测）：
 //  V1 信号无效值（RSRP<=-140）判定为「无锚点」（不误导为差）；LTE 行注明 NSA 正常
 //  V2 5G RSRQ 模块未上报时显示「N/A（未上报）」而非裸 --
@@ -783,43 +790,46 @@ return view.extend({
 			// ===== 分区组装（P1）=====
 
 			// 网络配置区：制式 / 频段（含 chip）/ APN（含预设）
-			const cfgSection = E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ '网络配置' ]),
-				E('div', { 'class': 'cbi-map' }, [
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '网络制式' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': rowFlex }, [ selMode, btnMode ]),
-							E('div', { 'style': 'margin-top:4px;font-size:12px;color:#666' },
-								[ '当前：' + (info.cur_allowed || '—') + '（优先 ' + (info.cur_preferred || '—') + '）' ])
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '频段锁定' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': rowFlex }, [ bandSel, btnBands ]),
-							E('div', { 'style': 'margin-top:4px;font-size:12px;color:#666' },
-								[ '当前启用 ' + nBands + ' 个频段：' ]),
-							bandChips(info.cur_bands, 16)
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ 'APN 参数' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': rowFlex }, [ apnPreset ]),
-							E('div', { 'style': rowFlex + ';margin-top:6px' }, [ apnInput, userInput, passInput, btnSave ])
-						])
-					]),
-					E('div', { 'class': 'cbi-value' }, [
-						E('label', { 'class': 'cbi-value-title' }, [ '智能选网（信号阈值切换）' ]),
-						E('div', { 'class': 'cbi-value-field' }, [
-							E('div', { 'style': rowFlex }, [
-								E('label', { 'style': 'cursor:pointer' }, [ guardChk, ' 5G 信号弱时自动切 4G' ]),
-								' 阈值 ', guardThreshold
-							]),
-							E('div', { 'style': 'margin-top:4px' }, [ guardState ]),
-							E('div', { 'style': 'margin-top:4px;font-size:12px;color:#b02a2c' },
-								[ '⚠ 默认关闭；开启后模块制式由信号自动切换，冷却 10 分钟尝试恢复 5G。' ])
+			// ===== v4.2：网络配置折叠为「高级设置」（简单/高级视图，默认收起）=====
+			const cfgSection = E('details', { 'class': 'cbi-section' }, [
+				E('summary', { 'style': 'cursor:pointer;font-weight:bold' }, [ '⚙ 高级设置（网络制式 / 频段锁定 / APN / 智能选网）' ]),
+				E('div', { 'style': 'margin-top:8px' }, [
+					E('div', { 'class': 'cbi-map' }, [
+						E('div', { 'class': 'cbi-value' }, [
+							E('label', { 'class': 'cbi-value-title' }, [ '网络制式' ]),
+							E('div', { 'class': 'cbi-value-field' }, [
+								E('div', { 'style': rowFlex }, [ selMode, btnMode ]),
+								E('div', { 'style': 'margin-top:4px;font-size:12px;color:#666' },
+									[ '当前：' + (info.cur_allowed || '—') + '（优先 ' + (info.cur_preferred || '—') + '）' ])
+							])
+						]),
+						E('div', { 'class': 'cbi-value' }, [
+							E('label', { 'class': 'cbi-value-title' }, [ '频段锁定' ]),
+							E('div', { 'class': 'cbi-value-field' }, [
+								E('div', { 'style': rowFlex }, [ bandSel, btnBands ]),
+								E('div', { 'style': 'margin-top:4px;font-size:12px;color:#666' },
+									[ '当前启用 ' + nBands + ' 个频段：' ]),
+								bandChips(info.cur_bands, 16)
+							])
+						]),
+						E('div', { 'class': 'cbi-value' }, [
+							E('label', { 'class': 'cbi-value-title' }, [ 'APN 参数' ]),
+							E('div', { 'class': 'cbi-value-field' }, [
+								E('div', { 'style': rowFlex }, [ apnPreset ]),
+								E('div', { 'style': rowFlex + ';margin-top:6px' }, [ apnInput, userInput, passInput, btnSave ])
+							])
+						]),
+						E('div', { 'class': 'cbi-value' }, [
+							E('label', { 'class': 'cbi-value-title' }, [ '智能选网（信号阈值切换）' ]),
+							E('div', { 'class': 'cbi-value-field' }, [
+								E('div', { 'style': rowFlex }, [
+									E('label', { 'style': 'cursor:pointer' }, [ guardChk, ' 5G 信号弱时自动切 4G' ]),
+									' 阈值 ', guardThreshold
+								]),
+								E('div', { 'style': 'margin-top:4px' }, [ guardState ]),
+								E('div', { 'style': 'margin-top:4px;font-size:12px;color:#b02a2c' },
+									[ '⚠ 默认关闭；开启后模块制式由信号自动切换，冷却 10 分钟尝试恢复 5G。' ])
+							])
 						])
 					])
 				])
@@ -1225,16 +1235,22 @@ return view.extend({
 				dom.content(simImsiNode, maskedNode(r.imsi));
 			});
 			const tempNode = E('span', {}, [ '…' ]);
+			const kpiTemp = E('span', {}, [ '…' ]);
 			callTemp().then(function(r) {
 				tempNode.textContent = r.ok ? (r.tsens + '°C') : '—';
+				kpiTemp.textContent = r.ok ? (r.tsens + '°C') : '—';
 			});
 			// v4：适配层信息（module_profile 异步）
 			const adapterNode = E('span', {}, [ '…' ]);
+			const ifaceNode = E('span', {}, [ '…' ]);
 			callModuleProfile().then(function(r) {
 				adapterNode.textContent = (r && r.adapter) ? r.adapter : '—';
+				if (r && r.ifname) ifaceNode.textContent = r.ifname;
 			});
 			// v4：本月流量（traffic_stats 异步）
 			const monthNode = E('span', {}, [ '…' ]);
+			const kpiToday = E('span', {}, [ '…' ]);
+			const kpiMonth = E('span', {}, [ '…' ]);
 			function fmtTraffic(v) {
 				if (v >= 1073741824) return (v / 1073741824.0).toFixed(2) + ' GB';
 				if (v >= 1048576) return (v / 1048576.0).toFixed(1) + ' MB';
@@ -1242,10 +1258,16 @@ return view.extend({
 				return v + ' B';
 			}
 			callTrafficStats().then(function(r) {
-				if (r && r.days && r.days.length)
-					monthNode.textContent = (r.month_total !== undefined ? ('本月 ' + fmtTraffic(r.month_total) + ' · ') : '') + '今日 ' + fmtTraffic(r.days[r.days.length - 1].total || 0);
-				else
+				if (r && r.days && r.days.length) {
+					const last = r.days[r.days.length - 1];
+					monthNode.textContent = (r.month_total !== undefined ? ('本月 ' + fmtTraffic(r.month_total) + ' · ') : '') + '今日 ' + fmtTraffic(last.total || 0);
+					kpiToday.textContent = fmtTraffic(last.total || 0);
+					kpiMonth.textContent = r.month_total !== undefined ? fmtTraffic(r.month_total) : '—';
+				} else {
 					monthNode.textContent = '统计中…（守护进程每分钟快照）';
+					kpiToday.textContent = '—';
+					kpiMonth.textContent = '—';
+				}
 			});
 
 			// ===== P6 局部刷新（仅重拉 status，不整页 reload）=====
@@ -1288,13 +1310,16 @@ return view.extend({
 			const tempDiv = E('div', {});
 			const rateDiv = E('div', {});
 			const speedNode = E('span', {}, [ '…' ]);
+			const kpiSpeed = E('span', {}, [ '…' ]);
 			const updateSpeed = function(points) {
 				const rates = trendRate(points);
 				if (rates.length) {
 					const last = rates[rates.length - 1].rate;
 					speedNode.textContent = '合计 ' + last.toFixed(2) + ' Mbps（60s 均值）';
+					kpiSpeed.textContent = last.toFixed(2) + ' Mbps';
 				} else {
 					speedNode.textContent = '—';
+					kpiSpeed.textContent = '—';
 				}
 			};
 			callTrend('120').then(function(r) {
@@ -1327,7 +1352,7 @@ return view.extend({
 				cells[11].textContent = (r.today_tsens && r.today_tsens.min !== '--') ? (r.today_tsens.min + ' / ' + r.today_tsens.max + ' / ' + r.today_tsens.avg + ' °C') : '数据采集中…';
 			});
 
-			// ===== 组装（P9 更新时间置顶）=====
+			// ===== 组装（P9 更新时间置顶 / v4.2 KPI 概览行）=====
 			// 窄屏单栏：≤720px 时状态/信息/数据面三卡纵向堆叠
 			if (!document.getElementById('m5g-media-css')) {
 				const st = document.createElement('style');
@@ -1335,14 +1360,38 @@ return view.extend({
 				st.textContent = '@media (max-width:720px){ #m5g-status-grid{ grid-template-columns:1fr !important; } }';
 				document.head.appendChild(st);
 			}
+			function fmtTime(ts) {
+				const d = new Date(ts * 1000);
+				return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+			}
+			const btnRefreshNow = E('button', { 'class': 'btn', 'style': 'padding:0 8px;font-size:11px;margin-left:10px', 'click': function() { location.reload(); } }, [ '立即刷新' ]);
 			const tsLine = E('p', { 'class': 'cbi-section-descr' },
-				[ '数据更新于 ' + new Date(info.ts * 1000).toLocaleTimeString(),
-					E('span', { 'style': 'margin-left:16px' }, [ autoChk, ' 自动刷新（30 秒，局部更新）' ]) ]);
-			function shortModel(m) { return m && m.length > 22 ? m.slice(0, 22) + '…' : (m || '未知模组'); }
+				[ '数据更新于 ' + fmtTime(info.ts),
+					E('span', { 'style': 'margin-left:16px' }, [ autoChk, ' 自动刷新（30 秒，局部更新）', btnRefreshNow ]) ]);
+			function shortModel(m) { return m ? String(m).split(' ')[0] : '未知模组'; }
+
+			// v4.2 KPI 概览行（同类 5G CPE/仪表盘共识：核心指标大字置顶）
+			const kpiRow = E('div', { 'id': 'm5g-kpi', 'style': 'display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px' });
+			function kpiCard(label, valueNode, sub) {
+				return E('div', { 'style': 'background:#fff;border:1px solid #E4E3DD;border-radius:10px;padding:10px 12px;box-sizing:border-box;min-width:0' }, [
+					E('div', { 'style': 'font-size:11px;color:#888;margin-bottom:2px;white-space:nowrap' }, [ label ]),
+					E('div', { 'style': 'font-size:20px;font-weight:600;color:#1A1B1C;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, [ valueNode ]),
+					sub ? E('div', { 'style': 'font-size:11px;color:#999;margin-top:2px' }, [ sub ]) : null
+				]);
+			}
+			[
+				kpiCard('连接状态', stateBadge, cn(TECH_CN, info.access_tech) || '—'),
+				kpiCard('信号强度', sig, has5gSig ? ('RSRP ' + info.signal_5g_rsrp + ' dBm') : '—'),
+				kpiCard('实时速率', kpiSpeed, '60s 均值'),
+				kpiCard('今日流量', kpiToday, 'wwan0 下行+上行'),
+				kpiCard('本月流量', kpiMonth, '本月累计'),
+				kpiCard('模块温度', kpiTemp, 'TSENS')
+			].forEach(function(c) { kpiRow.appendChild(c); });
 
 			return E('div', {}, [
 				E('h2', {}, [ '5G 模块状态', E('em', {}, [ ' · ' + shortModel(info.model) ]) ]),
 				bannerBox,
+				kpiRow,
 				E('div', { 'id': 'm5g-status-grid', 'style': 'display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;align-items:start' }, [
 					section('连接状态', [
 						[ '模块状态', stateBadge ],
@@ -1365,6 +1414,7 @@ return view.extend({
 						[ '适配层', adapterNode ]
 					]),
 					section('数据面', [
+						[ '数据面接口', ifaceNode ],
 						[ 'IPv4', info.wwan0_ipv4 ],
 						[ 'IPv6', info.wwan0_ipv6 ],
 						[ '本次会话流量', usageNode ],

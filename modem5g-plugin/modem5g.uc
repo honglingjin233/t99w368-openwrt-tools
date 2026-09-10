@@ -449,22 +449,35 @@ const methods = {
 				if (m)
 					push(smsPaths, { index: m[1], state: m[2] });
 			}
+			// 详情只拉最后 5 条（每条 mmcli -s 约 0.1-0.3s，全拉会阻塞 rpcd 串行队列）；其余仅状态
+			// ★ ucode 的 for...in 遍历的是数组元素（非下标），用计数器定位尾部
+			const DETAIL_LIMIT = 5;
 			const list = [];
+			let smsPos = 0;
+			const smsTotal = length(smsPaths);
 			for (let s in smsPaths) {
-				const out = execm("mmcli -s " + s.index + " --output-json 2>&1", 8);
-				try {
-					const j = json(out);
-					const sms = j && j.sms ? j.sms : {};
-					const cont = sms["content"] || {};
-					const prop = sms["properties"] || {};
-					push(list, {
-						index: s.index,
-						state: prop["state"] || s.state,
-						number: cont["number"] || "",
-						text: cont["text"] || "",
-						timestamp: prop["timestamp"] || ""
-					});
-				} catch (e) {}
+				smsPos++;
+				const isDetail = smsPos > smsTotal - DETAIL_LIMIT;
+				if (isDetail) {
+					const out = execm("mmcli -s " + s.index + " --output-json 2>&1", 8);
+					try {
+						const j = json(out);
+						const sms = j && j.sms ? j.sms : {};
+						const cont = sms["content"] || {};
+						const prop = sms["properties"] || {};
+						push(list, {
+							index: s.index,
+							state: prop["state"] || s.state,
+							number: cont["number"] || "",
+							text: cont["text"] || "",
+							timestamp: prop["timestamp"] || ""
+						});
+					} catch (e) {
+						push(list, { index: s.index, state: s.state, number: "", text: "", timestamp: "" });
+					}
+				} else {
+					push(list, { index: s.index, state: s.state, number: "", text: "", timestamp: "" });
+				}
 			}
 			// 倒序：最新在前；上限 20 条（防列表膨胀）
 			const rev = [];
@@ -637,7 +650,7 @@ const methods = {
 			for (let c in white)
 				if (c == cmd) allowed = true;
 			// 动态上下文 id（CGCONTRDP/CGPADDR 的 cid 可为 1-9，白名单不再写死 5）
-			if (!allowed && match(cmd, /^AT\+CGCONTRDP=[1-9]$|^AT\+CGPADDR=[1-9]$/))
+			if (!allowed && match(cmd, /^(?:AT\+CGCONTRDP=[1-9]|AT\+CGPADDR=[1-9])$/))
 				allowed = true;
 			if (!allowed)
 				return { ok: false, error: "仅允许预设只读查询指令" };
@@ -700,11 +713,13 @@ const methods = {
 						mbps = dr * 8 / dt / 1000000;
 				}
 			}
-			return { ok: true, dl_mbps: sprintf("%.2f", mbps), ul_mbps: sprintf("%.2f", mbps),
-				dl: sprintf("%.2f", mbps), ul: sprintf("%.2f", mbps) };
-		}
-	},
-	// 控制：一键诊断（action=start 后台生成 / action=get 读取报告）
+			return { ok: true, total_mbps: sprintf("%.2f", mbps),
+				dl_mbps: sprintf("%.2f", mbps), ul_mbps: sprintf("%.2f", mbps),
+				dl: sprintf("%.2f", mbps), ul: sprintf("%.2f", mbps),
+				note: "趋势缓存只存 rx+tx 合计，dl/ul 均等于合计值" };
+			}
+			},
+			// 控制：一键诊断（action=start 后台生成 / action=get 读取报告）
 	diagnostic: {
 		args: { action: "" },
 		call: function(request) {
@@ -816,7 +831,13 @@ const methods = {
 			for (let b in rawBands)
 				if (match(b, /^ngran-/))
 					push(bands, b);
-			const t0 = trim(exec("date +%s -d \"$(date +%F)\" 2>/dev/null")) || "0";
+			// 当日 0 点 epoch：busybox ash 无 GNU date -d 也不支持 10# 前缀
+			// → 先 ${H#0} 去前导零（08/09 被当八进制会报错），再算术
+			// 注意：ucode 双引号字符串可能把 ${...} 当模板插值 → 用字符串拼接拆开
+			const t0exp = "N=$(date +%s); H=$(date +%H); M=$(date +%M); S=$(date +%S); "
+				+ "H=$" + "{H#0}; M=$" + "{M#0}; S=$" + "{S#0}; "
+				+ "echo $(( N - H*3600 - M*60 - S ))";
+			const t0 = trim(exec(t0exp)) || "0";
 			const stat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $2!=\"--\" && $2!=\"\" {n++; s+=$2; if(n==1||$2>mx)mx=$2; if(n==1||$2<mn)mn=$2} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
 			const sp = split(trim(stat), " ");
 			const tstat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $4!=\"--\" && $4!=\"\" {n++; s+=$4; if(n==1||$4>mx)mx=$4; if(n==1||$4<mn)mn=$4} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
@@ -896,7 +917,10 @@ const methods = {
 					monthTotal += d.total;
 			}
 			const today = length(days) ? days[length(days) - 1].day : "";
-			return { days: days, month_total: monthTotal, today: today, running: !!trim(exec("kill -0 $(cat /tmp/m5g-traffic.pid 2>/dev/null) 2>/dev/null && echo 1")) };
+			// 空 pid 时 kill -0 '' 会报错 → 先取再判，防空值
+			const tpid = trim(exec("cat /tmp/m5g-traffic.pid 2>/dev/null"));
+			const tAlive = tpid && trim(exec("kill -0 " + tpid + " 2>/dev/null && echo 1"));
+			return { days: days, month_total: monthTotal, today: today, running: !!tAlive };
 			} catch (e) {
 				return { days: [], month_total: 0, today: "", running: false, error: "异常: " + e };
 			}
@@ -920,8 +944,22 @@ const methods = {
 			const pp = exec("ping -c 3 -W 2 -I wwan0 223.5.5.5 2>&1") || "";
 			const ps = match(pp, /(\d+) packets transmitted, (\d+) received/);
 			add("公网连通(223.5.5.5)", ps ? int(ps[2]) > 0 : false, ps ? (ps[1] + " 发 / " + ps[2] + " 收") : trim(split(pp, "\n")[0]));
-			const dn = exec("nslookup www.baidu.com 2>&1") || "";
-			add("DNS 解析", !!match(dn, /Address/), match(dn, /Address/) ? "www.baidu.com 解析成功" : "解析失败");
+			const dn0 = exec("nslookup www.baidu.com 2>&1") || "";
+			let dnsOk = !!match(dn0, /Address/);
+			let dnsDetail = dnsOk ? "www.baidu.com 解析成功" : "";
+			// nslookup 可能未装（dnsutils 非默认包）→ 降级 host / ping 域名实测
+			if (!dnsOk) {
+				const dn1 = exec("host www.baidu.com 2>&1") || "";
+				dnsOk = !!match(dn1, /has address/);
+				if (dnsOk) dnsDetail = "www.baidu.com 解析成功(host)";
+			}
+			if (!dnsOk) {
+				const dn2 = exec("ping -c 1 -W 2 -I wwan0 www.baidu.com 2>&1") || "";
+				dnsOk = !!match(dn2, /1 packets received|bytes from/);
+				if (dnsOk) dnsDetail = "www.baidu.com 域名可通(ping 实测)";
+			}
+			if (!dnsOk) dnsDetail = "解析失败(nslookup/host/ping 均不可用)";
+			add("DNS 解析", dnsOk, dnsDetail);
 			const mt = exec("ping -c 1 -W 2 -s 1450 -M do -I wwan0 223.5.5.5 2>&1") || "";
 			const mtOk = !!match(mt, /1 packets received|bytes from/);
 			add("MTU 1450 探测", mtOk, mtOk ? "可通过（数据面可承载 1450B 报文）" : "1450 过大或不支持 -M（可接受，不影响上网）");
