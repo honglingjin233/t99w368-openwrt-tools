@@ -568,19 +568,19 @@ const methods = {
 			else if (state == "failed") detail = "发送失败(模块回报 failed): " + trim(sent);
 			else if (state) detail = "已提交，状态: " + state;
 			else detail = ok ? "短信已发送" : "发送失败: " + trim(sent);
-			// 写入本地已发送记录（/tmp/m5g-sent.json，行存储 ts|iso|number|text|ok|detail|sms_id，上限 100 条）
+			// 写入本地已发送记录（/etc/modem5g-sent.json 持久化，行存储 ts|iso|number|text|ok|detail|sms_id，上限 100 条）
 			// 注：老 ucode 无 String()/json 序列化 → ""+time() 拼接 + 读旧行 + 追加 + 截断 + writefile 全量写回
 			try {
 				const iso = trim(exec("date '+%Y-%m-%d %H:%M:%S'")) || "";
 				const esc_t = replace(replace(replace(text, "|", "/"), "\n", " "), "\r", " ");
 				const esc_d = replace(replace(replace(detail, "|", "/"), "\n", " "), "\r", " ");
 				const rec = "" + time() + "|" + iso + "|" + number + "|" + esc_t + "|" + (ok ? "1" : "0") + "|" + esc_d + "|" + sid;
-				const lines = split(exec("cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
+				const lines = split(exec("cat /etc/modem5g-sent.json 2>/dev/null || cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
 				push(lines, rec);
 				const st = length(lines) > 100 ? length(lines) - 100 : 0;
 				let content = "";
 				for (let i = st; i < length(lines); i++) content += lines[i] + "\n";
-				writefile("/tmp/m5g-sent.json", content);
+				writefile("/etc/modem5g-sent.json", content);
 			} catch (e3) {}
 			return { ok: ok, detail: detail, sms_id: sid };
 			return { ok: ok, detail: detail, sms_id: sid };
@@ -599,11 +599,11 @@ const methods = {
 			return { ok: ok, detail: ok ? "短信已删除" : "删除失败: " + trim(out) };
 		}
 	},
-	// 只读：本地已发送记录（/tmp/m5g-sent.json 行存储，倒序）
+	// 只读：本地已发送记录（/etc/modem5g-sent.json 持久化，行存储，倒序）
 	sms_sent: {
 		call: function() {
 			try {
-				const lines = split(exec("cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
+				const lines = split(exec("cat /etc/modem5g-sent.json 2>/dev/null || cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
 				const arr = [];
 				for (let i = 0; i < length(lines); i++) {
 					const ln = lines[i];
@@ -626,14 +626,14 @@ const methods = {
 			if (!match(ts, /^\d+$/))
 				return { ok: false, error: "参数非法" };
 			try {
-				const lines = split(exec("cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
+				const lines = split(exec("cat /etc/modem5g-sent.json 2>/dev/null || cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
 				let content = "";
 				for (let i = 0; i < length(lines); i++) {
 					const ln = lines[i];
 					if (ln == "") continue;
 					if (split(ln, "|")[0] != ts) content += ln + "\n";
 				}
-				writefile("/tmp/m5g-sent.json", content);
+				writefile("/etc/modem5g-sent.json", content);
 				return { ok: true, detail: "记录已删除" };
 			} catch (e) { return { ok: false, error: "删除失败" }; }
 		}
