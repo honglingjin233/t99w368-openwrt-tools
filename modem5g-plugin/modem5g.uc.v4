@@ -1250,26 +1250,10 @@ const modem5g_extra = {
 						today_rsrp: { min: sp[0] || "--", max: sp[1] || "--", avg: sp[2] || "--" },
 						today_tsens: { min: tp[0] || "--", max: tp[1] || "--", avg: tp[2] || "--" }
 					};
-					// ---- 当前占用频段（serving cell 实测；qeng 解析，失败/无信号返回空 → 前端降级启用分布） ----
+					// ---- 当前占用频段（serving cell 实测；qeng 解析，失败/无信号返回空） ----
+					// ⚠️ T99W368(ADB) 上 AT+QENG 挂起10s+最终ERROR，且前端不读 occ_bands(仅mock) →
+					//    暂禁查询，occ 恒空；模块原生支持 serving cell 时再启用
 					const occ = [];
-					try {
-						const vn = mp["vendor"] || "";
-						if (vn != "fibocom") {
-							const sq = atQuery(model, 'AT+QENG="servingcell"', true) || "";
-							const lines = split(sq, "\n");
-							for (let li = 0; li < length(lines); li++) {
-								if (!match(lines[li], /servingcell/)) continue;
-								const body = replace(replace(lines[li], "+QENG:", ""), "+QENG", "");
-								const f = split(trim(body), ",");
-								if (length(f) < 9) continue;
-								const tech = replace(replace(replace(f[2], '"', ""), "'", ""), " ", "");
-								const band = replace(replace(trim(f[8]), '"', ""), "'", "");
-								if (!match(band, /^[0-9]+$/)) continue;
-								if (tech == "LTE") push(occ, "B" + band);
-								else if (match(tech, /^NR/)) push(occ, "n" + band);
-							}
-						}
-					} catch (e) {}
 					// ---- 宿主机关键实时信息（OpenFi6C 自身：温度/内存/负载/连接/磁盘/运行时长） ----
 					let host = {};
 					try {
