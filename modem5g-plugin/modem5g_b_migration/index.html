@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5G 模组管理 · B 方案</title>
+<script src="echarts.min.js"></script>
+<style>
+  :root{
+    --primary:#1677ff; --bg:#f5f6f8; --card:#fff; --line:#e5e6eb;
+    --text:#1f2329; --sub:#8a919f; --ok:#52c41a; --warn:#faad14; --bad:#f5222d;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text);font-size:14px}
+  .topbar{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+  .topbar-in{max-width:1200px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  .brand{font-size:16px;font-weight:700}
+  .brand small{font-size:12px;color:var(--sub);font-weight:400;margin-left:8px}
+  .nav{display:flex;gap:2px;flex-wrap:wrap}
+  .nav a{display:block;padding:7px 14px;border-radius:6px;color:#4e5969;text-decoration:none;font-size:13px}
+  .nav a:hover{background:#eef3ff;color:var(--primary)}
+  .nav a.on{background:var(--primary);color:#fff}
+  .demo-tag{font-size:11px;color:var(--warn);background:#fff7e6;border:1px solid #ffd591;padding:2px 8px;border-radius:4px;margin-left:auto}
+  .demo-tag.api{color:var(--ok);background:#e8f7e8;border-color:#b7eb8f}
+  main{max-width:1200px;margin:0 auto;padding:16px}
+  .page{display:none}
+  .page.on{display:block}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+  .kpi .lbl{font-size:12px;color:var(--sub)}
+  .kpi .val{font-size:24px;font-weight:700;margin-top:4px}
+  .kpi .val small{font-size:12px;color:var(--sub);font-weight:400}
+  .kpi .sub{font-size:12px;color:var(--sub);margin-top:2px}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:16px}
+  .panel h3{font-size:14px;margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .panel h3 .dot{width:6px;height:6px;border-radius:50%;background:var(--primary);display:inline-block}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+  .chart{width:100%;height:260px}
+  .host-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;height:260px;align-content:stretch}
+  .host-card{background:var(--bg,#f7f8fa);border:1px solid var(--line);border-radius:8px;padding:6px 10px;display:flex;flex-direction:column;justify-content:center;min-width:0;overflow:hidden}
+  .host-lbl{font-size:10px;color:var(--sub);white-space:nowrap}
+  .host-val{font-size:16px;font-weight:700;margin-top:2px;white-space:nowrap;line-height:1.2}
+  .host-val small{font-size:9px;color:var(--sub);font-weight:400}
+  .host-sub{font-size:9px;color:var(--sub);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 24px}
+  .kv .it{display:flex;justify-content:space-between;font-size:13px;padding:6px 0;border-bottom:1px dashed #f0f1f3}
+  .kv .it .k{color:var(--sub)}
+  .kv .it .v{font-weight:600}
+  .bar-wrap{margin:10px 0}
+  .bar-top{display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px}
+  .bar-top .b-v{font-weight:600}
+  .bar{background:#f0f1f3;height:10px;border-radius:5px;overflow:hidden}
+  .bar i{display:block;height:100%;border-radius:5px}
+  .g{background:var(--ok)} .y{background:var(--warn)} .r{background:var(--bad)} .n{background:#c9cdd4}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+  .chip{padding:4px 12px;border:1px solid var(--line);border-radius:14px;font-size:12px;color:#4e5969;cursor:pointer;user-select:none}
+  .chip.on{background:var(--primary);border-color:var(--primary);color:#fff}
+  .btn{display:inline-block;padding:6px 16px;background:var(--primary);color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer}
+  .btn.ghost{background:#fff;color:var(--primary);border:1px solid var(--primary)}
+  .btn.danger{background:var(--bad)}
+  .btn.dirty{background:#faad14;color:#000}
+  .btn:active{opacity:.85}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .input{padding:6px 12px;border:1px solid var(--line);border-radius:6px;font-size:13px;outline:none;width:100%}
+  .input:focus{border-color:var(--primary)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:8px 10px;border-bottom:1px solid #f0f1f3;text-align:left}
+  th{color:var(--sub);font-weight:500;background:#fafbfc}
+  .badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px}
+  .badge.g{background:#e8f7e8;color:var(--ok)} .badge.y{background:#fff7e6;color:#d48806}
+  .badge.r{background:#fff1f0;color:var(--bad)} .badge.b{background:#eef3ff;color:var(--primary)}
+  .sms-item{padding:10px 12px;border:1px solid var(--line);border-radius:8px;margin:8px 0;font-size:13px}
+  .sms-item .h{display:flex;justify-content:space-between;color:var(--sub);font-size:12px;margin-bottom:4px}
+  .term{background:#1e1e1e;color:#d4d4d4;border-radius:8px;padding:12px;font-family:Consolas,Menlo,monospace;font-size:12px;min-height:180px;white-space:pre-wrap;overflow:auto}
+  .at-short{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+  .at-short button{padding:4px 12px;border:1px solid var(--line);border-radius:14px;background:#fff;font-size:12px;cursor:pointer}
+  .at-short button:hover{border-color:var(--primary);color:var(--primary)}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#2b2f36;color:#fff;padding:8px 18px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .25s;z-index:99;pointer-events:none}
+  .toast.show{opacity:1}
+  .sms-tabs{display:flex;gap:8px;margin-bottom:10px}
+  .sms-tab{padding:4px 14px;border:1px solid var(--line);border-radius:14px;font-size:12px;cursor:pointer;color:#4e5969;user-select:none}
+  .sms-tab.on{background:var(--primary);border-color:var(--primary);color:#fff}
+  .sms-item{cursor:pointer;transition:border-color .15s}
+  .sms-item:hover{border-color:var(--primary)}
+  .sms-item .clip{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:12px;color:#333;line-height:1.5}
+  #sms-list{flex:1 1 auto;min-height:0;overflow-y:auto}
+  .badge-u{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--primary);margin-right:6px;vertical-align:middle}
+  .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:120}
+  .modal-mask.show{display:flex}
+  .modal{background:#fff;border-radius:10px;padding:18px;max-width:520px;width:92%;max-height:78vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.18)}
+  .modal-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .modal-x{cursor:pointer;font-size:20px;color:var(--sub);line-height:1}
+  .sms-full{font-size:13px;line-height:1.7;white-space:pre-wrap;background:#f7f8fa;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:200px;overflow:auto}
+  .sms-meta{font-size:12px;color:var(--sub);margin-bottom:8px;line-height:1.8}
+  .wd-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .wd-bar .btn{padding:3px 12px;font-size:12px}
+  .switch{position:relative;display:inline-block;width:40px;height:22px;vertical-align:middle}
+  .switch input{display:none}
+  .switch i{position:absolute;inset:0;background:#c9cdd4;border-radius:11px;transition:.2s}
+  .switch i::after{content:'';position:absolute;left:2px;top:2px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s}
+  .switch input:checked+i{background:var(--ok)}
+  .switch input:checked+i::after{transform:translateX(18px)}
+  .warn-banner{background:#fff7e6;border:1px solid #ffd591;color:#ad6800;padding:8px 12px;border-radius:6px;font-size:13px;margin-bottom:12px}
+  .danger-zone{border:1px dashed #ffccc7;background:#fff2f0;border-radius:8px;padding:12px}
+  .danger-zone .dz-title{color:var(--bad);font-size:13px;font-weight:600;margin-bottom:8px}
+  .mono{font-family:Consolas,Menlo,monospace;font-size:12px}
+  /* 网络状态页：数据面移至载波聚合下方，基本信息与信号板同列 */
+  #page-sms .grid2{grid-template-columns:1fr 1fr}
+  #page-sms .grid2 > .panel{height:380px;box-sizing:border-box;display:flex;flex-direction:column}
+  #page-sms .grid2 > .panel > h3{flex:none}
+  #page-sms .grid2 > .panel > .row:last-child{margin-top:auto;flex:none}
+  #page-sms .grid2 > .panel > textarea{flex:none}
+  #page-sms .grid2 > .panel > .row:nth-child(2){flex:none}
+  #page-sms .sms-tabs{flex:none}
+  @media(max-width:760px){#page-sms .grid2{grid-template-columns:1fr}}
+  #page-network-status .grid2{grid-template-columns:repeat(3,1fr)}
+  #page-network-status .grid2 > .panel:nth-child(1){grid-column:1;grid-row:1}
+  #page-network-status .grid2 > .panel:nth-child(2){grid-column:2;grid-row:1}
+  #page-network-status .grid2 > .panel:nth-child(3){grid-column:3;grid-row:1}
+  #page-network-status .grid2 > .panel:nth-child(4){grid-column:3;grid-row:2}
+  #page-network-status .grid2 > .panel:nth-child(5){grid-column:2;grid-row:2}
+  #page-network-status .grid2 > .panel:nth-child(6){grid-column:1;grid-row:2}
+  /* 仪表盘图表区：3 列 x 2 行，窄屏降列 */
+  #dash-charts{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:1100px){ #dash-charts{grid-template-columns:repeat(2,1fr)} }
+  @media(max-width:640px){ #dash-charts{grid-template-columns:1fr} }
+  /* 网络配置页：行1 三块 + 行2 小区锁定 | 邻区扫描（跨 2 列） */
+  #page-network-config .grid2{grid-template-columns:repeat(3,1fr)}
+  #page-network-config .grid2 > .panel:nth-child(1){grid-column:1;grid-row:1}
+  #page-network-config .grid2 > .panel:nth-child(2){grid-column:2;grid-row:1}
+  #page-network-config .grid2 > .panel:nth-child(3){grid-column:3;grid-row:1}
+  #page-network-config .grid2 > .panel:nth-child(4){grid-column:1;grid-row:2}
+  #page-network-config .grid2 > .panel:nth-child(5){grid-column:2 / span 2;grid-row:2}
+  @media(max-width:1100px){
+    #page-network-config .grid2{grid-template-columns:1fr}
+    #page-network-config .grid2 > .panel{grid-column:auto;grid-row:auto}
+  }
+  /* 制式分段控件 */
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .seg .seg-it{padding:6px 14px;font-size:13px;cursor:pointer;border-right:1px solid var(--line);background:#fff;color:#4e5969;user-select:none}
+  .seg .seg-it:last-child{border-right:none}
+  .seg .seg-it.on{background:var(--primary);color:#fff}
+  td .num{font-family:Consolas,Menlo,monospace}
+  table tbody tr:hover{background:#fafbfc}
+  @media(max-width:980px){
+    #page-network-status .grid2{grid-template-columns:1fr}
+    #page-network-status .grid2 > .panel{grid-column:auto;grid-row:auto}
+  }
+  @media(max-width:640px){ .chart{height:200px} .nav{width:100%;overflow-x:auto} body{font-size:15px} input,textarea{font-size:16px} .nav a{padding:10px 14px} }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="topbar-in">
+    <div class="brand">5G 模组管理<small id="brand-model">SDXLEMUR-SD-MTP · 多模组适配</small></div>
+    <nav class="nav" id="nav">
+      <a href="#/dashboard" data-p="dashboard">仪表盘</a>
+      <a href="#/network-status" data-p="network-status">网络状态</a>
+      <a href="#/network-config" data-p="network-config">网络配置</a>
+      <a href="#/sms" data-p="sms">短信中心</a>
+      <a href="#/atdebug" data-p="atdebug">AT 调试</a>
+      <a href="#/system" data-p="system">系统设置</a>
+    </nav>
+    <span class="demo-tag" id="mode-tag">连接中…</span>
+  </div>
+</div>
+<main id="main">
+
+<!-- ===== 视图：仪表盘 ===== -->
+<section class="page" id="page-dashboard">
+  <div class="warn-banner" id="wd-banner" style="display:none"><span class="wd-bar"><span id="wd-banner-txt">数据面看门狗未运行（防止假连接/断线无人重拨）</span><button class="btn" id="btn-wd-on-banner">立即启用</button></span></div>
+  <div class="warn-banner" id="sig-banner" style="display:none"></div>
+  <div class="cards">
+    <div class="kpi"><div class="lbl">连接状态</div><div class="val" id="kpi-state">—</div><div class="sub" id="kpi-state-sub">—</div></div>
+    <div class="kpi"><div class="lbl">信号质量</div><div class="val" id="kpi-sig">—</div><div class="sub" id="kpi-sig-sub">—</div></div>
+    <div class="kpi"><div class="lbl">实时速率</div><div class="val" id="kpi-rate">—</div><div class="sub">下行+上行（均值）</div></div>
+    <div class="kpi"><div class="lbl">流量</div><div class="val" id="kpi-flow">—</div><div class="sub" id="kpi-flow-sub">本月累计 —</div></div>
+    <div class="kpi"><div class="lbl">模块温度</div><div class="val" id="kpi-temp">—</div><div class="sub" id="kpi-temp-sub">TSENS</div></div>
+  </div>
+  <div class="grid2" id="dash-charts">
+    <div class="panel"><h3><span class="dot"></span>速率趋势（上下行面积图 · 60s 均值）</h3><div class="chart" id="ch-rate"></div></div>
+    <div class="panel"><h3><span class="dot"></span>信号趋势（RSRP / SINR）</h3><div class="chart" id="ch-sig"></div></div>
+    <div class="panel"><h3><span class="dot"></span>模组温度（今日采样）</h3><div class="chart" id="ch-temp"></div></div>
+    <div class="panel"><h3><span class="dot"></span>近 7 日流量（每日下行/上行 · 今日为真值）</h3><div class="chart" id="ch-flow7"></div></div>
+    <div class="panel"><h3><span class="dot"></span>宿主机状态（OpenFi6C 实时）</h3>
+      <div class="host-grid">
+        <div class="host-card"><div class="host-lbl">CPU 温度</div><div class="host-val" id="host-cputemp">—</div></div>
+        <div class="host-card"><div class="host-lbl">内存占用</div><div class="host-val" id="host-mem">—</div><div class="host-sub" id="host-mem-sub">—</div></div>
+        <div class="host-card"><div class="host-lbl">系统负载</div><div class="host-val" id="host-load">—</div></div>
+        <div class="host-card"><div class="host-lbl">活动连接</div><div class="host-val" id="host-conn">—</div></div>
+        <div class="host-card"><div class="host-lbl">磁盘占用</div><div class="host-val" id="host-disk">—</div></div>
+        <div class="host-card"><div class="host-lbl">运行时长</div><div class="host-val" id="host-up">—</div></div>
+        <div class="host-card"><div class="host-lbl">风扇转速</div><div class="host-val" id="host-fan">—</div></div>
+        <div class="host-card"><div class="host-lbl">无线温度</div><div class="host-val" id="host-wtemp">—</div></div>
+      </div>
+    </div>
+    <div class="panel"><h3><span class="dot"></span>网络实时（宿主机吞吐 / 连接）</h3>
+      <div class="host-grid">
+        <div class="host-card"><div class="host-lbl">WAN 下行</div><div class="host-val" id="net-wan-rx">—</div></div>
+        <div class="host-card"><div class="host-lbl">WAN 上行</div><div class="host-val" id="net-wan-tx">—</div></div>
+        <div class="host-card"><div class="host-lbl">LAN 下行</div><div class="host-val" id="net-lan-rx">—</div></div>
+        <div class="host-card"><div class="host-lbl">LAN 上行</div><div class="host-val" id="net-lan-tx">—</div></div>
+        <div class="host-card"><div class="host-lbl">无线客户端</div><div class="host-val" id="net-wifi">—</div></div>
+        <div class="host-card"><div class="host-lbl">DHCP 租约</div><div class="host-val" id="net-dhcp">—</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 视图：网络状态 ===== -->
+<section class="page" id="page-network-status">
+  <div class="grid2">
+    <div class="panel">
+      <h3><span class="dot"></span>信号板</h3>
+      <div class="bar-wrap"><div class="bar-top"><span>信号强度</span><span class="b-v" id="sig-bar0-v">—</span></div><div class="bar"><i id="sig-bar0-i" style="width:0"></i></div></div>
+      <div class="bar-wrap"><div class="bar-top"><span>5G RSRP</span><span class="b-v" id="sig-bar1-v">—</span></div><div class="bar"><i id="sig-bar1-i" style="width:0"></i></div></div>
+      <div class="bar-wrap"><div class="bar-top"><span>5G SINR</span><span class="b-v" id="sig-bar2-v">—</span></div><div class="bar"><i id="sig-bar2-i" style="width:0"></i></div></div>
+      <div class="bar-wrap"><div class="bar-top"><span>5G RSRQ</span><span class="b-v" id="sig-bar3-v">—</span></div><div class="bar"><i id="sig-bar3-i" style="width:0"></i></div></div>
+      <div style="font-size:12px;color:var(--sub);margin-top:8px" id="sig-today">今日统计加载中…</div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>网络参数</h3>
+      <div class="kv">
+        <div class="it"><span class="k">网络类型</span><span class="v" id="net-type">—</span></div>
+        <div class="it"><span class="k">运营商</span><span class="v" id="net-op">—</span></div>
+        <div class="it"><span class="k">注册状态</span><span class="v" id="net-reg">—</span></div>
+        <div class="it"><span class="k">接入技术</span><span class="v" id="net-tech">—</span></div>
+        <div class="it"><span class="k">数据连接</span><span class="v" id="net-packet">—</span></div>
+        <div class="it"><span class="k">数据面接口</span><span class="v" id="net-iface">—</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>载波聚合 / 小区</h3>
+      <div class="kv">
+        <div class="it"><span class="k">载波聚合</span><span class="v" id="net-ca">—</span></div>
+        <div class="it"><span class="k">5G 频段</span><span class="v" id="net-bands5g">—</span></div>
+        <div class="it"><span class="k">LTE 锚点</span><span class="v" id="net-lte">—</span></div>
+        <div class="it"><span class="k">PCI / 频点</span><span class="v">模块未上报明细</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>数据面</h3>
+      <div class="kv">
+        <div class="it"><span class="k">数据面接口</span><span class="v" id="net-iface2">—</span></div>
+        <div class="it"><span class="k">IPv4</span><span class="v mono" id="net-ipv4">—</span></div>
+        <div class="it"><span class="k">IPv6</span><span class="v mono" id="net-ipv6">—</span></div>
+        <div class="it"><span class="k">实时速率</span><span class="v" id="net-rate">—</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>网络质量（PING 时延）</h3>
+      <div class="kv">
+        <div class="it"><span class="k">PING 网关</span><span class="v" id="net-ping-gw">未测试</span></div>
+        <div class="it"><span class="k">PING DNS 223.5.5.5</span><span class="v" id="net-ping-dns">未测试</span></div>
+        <div class="it"><span class="k">抖动</span><span class="v" id="net-jitter">—</span></div>
+        <div class="it"><span class="k">丢包率</span><span class="v" id="net-loss">—</span></div>
+        <div class="it"><span class="k">一键测试</span><span class="v" id="net-ping-ctl"><button class="btn" id="btn-ping-now" style="padding:2px 12px;font-size:12px">Ping 测试</button></span></div>
+        <div class="it"><span class="k">上次体检</span><span class="v" id="net-hc">—</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>基本信息</h3>
+      <div class="kv">
+        <div class="it"><span class="k">厂商</span><span class="v" id="net-mfg">—</span></div>
+        <div class="it"><span class="k">型号</span><span class="v" id="net-model">—</span></div>
+        <div class="it"><span class="k">固件版本</span><span class="v" id="net-fw">—</span></div>
+        <div class="it"><span class="k">IMEI</span><span class="v mono" id="net-imei">—</span></div>
+        <div class="it"><span class="k">ICCID</span><span class="v mono" id="net-iccid">—</span></div>
+        <div class="it"><span class="k">IMSI</span><span class="v mono" id="net-imsi">—</span></div>
+        <div class="it"><span class="k">模块温度</span><span class="v" id="net-temp">—</span></div>
+        <div class="it"><span class="k">适配层</span><span class="v" id="net-adapter">—</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 视图：网络配置 ===== -->
+<section class="page" id="page-network-config">
+  <div class="grid2">
+    <div class="panel">
+      <h3><span class="dot"></span>拨号设置（APN）</h3>
+      <div class="row" style="margin-bottom:10px">
+        <input class="input" id="apn-input" style="max-width:200px" placeholder="APN，如 cmnet">
+        <input class="input" id="user-input" style="max-width:120px" placeholder="用户名（可选）">
+        <input class="input" id="pass-input" style="max-width:120px" type="password" placeholder="密码（可选）">
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <select class="input" id="apn-preset" style="max-width:220px">
+          <option value="">— 运营商预设 —</option>
+          <option value="cmnet">中国移动 cmnet</option>
+          <option value="cmwap">中国移动 cmwap</option>
+          <option value="ctnet">中国电信 ctnet</option>
+          <option value="3gnet">中国联通 3gnet</option>
+        </select>
+        <button class="btn" id="btn-saveapn">保存并重拨</button>
+      </div>
+      <div class="kv" style="margin-top:6px">
+        <div class="it"><span class="k">当前 APN</span><span class="v" id="cfg-apn-cur">—</span></div>
+        <div class="it"><span class="k">拨号通道</span><span class="v" id="cfg-proto">—</span></div>
+        <div class="it"><span class="k">数据面接口</span><span class="v" id="cfg-iface">—</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>制式选择</h3>
+      <div class="seg" id="mode-seg">
+        <span class="seg-it" data-mode="auto">自动（5G 优先）</span>
+        <span class="seg-it" data-mode="5g">仅 5G</span>
+        <span class="seg-it" data-mode="4g">仅 4G</span>
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--sub)" id="cfg-mode-cur">当前制式：—</div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="btn-mode">应用制式</button></div>
+      <div style="margin-top:8px;font-size:12px;color:var(--warn)">⚠ 制式切换会重新注册网络（短暂断网）；对部分模组属于写操作，执行前需确认。</div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>频段锁定（5G）</h3>
+      <div style="font-size:12px;color:var(--sub)" id="cfg-bands-cur">当前启用频段加载中…</div>
+      <div style="font-size:12px;color:var(--sub);margin-top:6px">5G 频段（可多选，点击切换）</div>
+      <div class="chips" id="chips-5g"></div>
+      <div class="row" style="margin-top:12px"><button class="btn" id="btn-bands">应用频段</button><button class="btn ghost" id="btn-bands-reset">恢复默认</button></div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>小区锁定（Cell Lock）</h3>
+      <div class="row">
+        <input class="input" id="cell-pci" style="max-width:120px" placeholder="PCI" value="">
+        <input class="input" id="cell-arfcn" style="max-width:140px" placeholder="频点(ARFCN)" value="">
+        <button class="btn" id="btn-celllock" disabled>锁定小区</button>
+      </div>
+      <div style="margin-top:10px;font-size:12px;color:var(--sub)" id="cell-state">当前状态：<span class="badge b">未锁定（自动选网）</span></div>
+      <div class="row" style="margin-top:10px"><button class="btn ghost" id="btn-cellunlock" disabled>关闭锁定</button></div>
+      <div style="margin-top:10px;font-size:12px;color:var(--warn)" id="cell-note">小区锁定为写操作（可能短暂失联），后端暂未开放；视模组支持情况后续提供。</div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>邻区扫描（邻小区质量评估）</h3>
+      <table>
+        <thead><tr><th>PCI</th><th>运营商</th><th>制式/频点</th><th>状态</th></tr></thead>
+        <tbody id="scan-body"><tr><td colspan="4" style="color:var(--sub)">尚未扫描</td></tr></tbody>
+      </table>
+      <div class="row" style="margin-top:12px"><button class="btn" id="btn-scan">重新扫描</button><span style="font-size:12px;color:var(--sub)" id="scan-hint">扫描约 60-90 秒，期间网络可能短暂断开</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 视图：短信中心 ===== -->
+<section class="page" id="page-sms">
+  <div class="grid2">
+    <div class="panel">
+      <h3><span class="dot"></span>发送短信</h3>
+      <div class="row" style="margin-bottom:10px"><input class="input" id="sms-num" style="max-width:200px" placeholder="收件号码"><span style="font-size:12px;color:var(--sub)" id="sms-count">存储 0/50</span></div>
+      <textarea class="input" id="sms-text" rows="4" placeholder="短信内容" style="resize:vertical"></textarea>
+      <div class="row" style="margin-top:10px"><button class="btn" id="btn-sendsms">发送</button><span style="font-size:12px;color:var(--sub)">提示：收发短信需切换 4G，发送后自动恢复原制式</span></div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>短信列表</h3>
+      <div class="sms-tabs"><span class="sms-tab on" id="tab-in">收件箱</span><span class="sms-tab" id="tab-out">已发送</span></div>
+      <div id="sms-list"><div style="color:var(--sub);font-size:13px">加载中…</div></div>
+      <div class="row" style="margin-top:10px"><button class="btn ghost" id="btn-reloadsms">刷新列表</button></div>
+    </div>
+  </div>
+</section>
+<!-- 短信详情弹窗 -->
+<div class="modal-mask" id="sms-modal">
+  <div class="modal">
+    <div class="modal-h"><b id="sms-m-title">短信详情</b><span class="modal-x" id="sms-m-close">×</span></div>
+    <div id="sms-m-body"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn" id="sms-m-reply">回复</button>
+      <button class="btn danger" id="sms-m-del">删除</button>
+      <button class="btn ghost" id="sms-m-ok">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 视图：AT 调试 ===== -->
+<section class="page" id="page-atdebug">
+  <div class="panel">
+    <h3><span class="dot"></span>AT 命令终端（适配层通道，预设只读指令）</h3>
+    <div class="at-short" id="at-short"></div>
+    <div class="row" style="margin:10px 0">
+      <input class="input" id="at-input" placeholder="输入 AT 命令，如 ATI" style="font-family:Consolas,Menlo,monospace;max-width:420px">
+      <button class="btn" id="btn-at-send">发送</button>
+      <button class="btn ghost" id="btn-at-clear">清空</button>
+    </div>
+    <div class="term" id="at-out">连接 AT 服务（适配层通道）…</div>
+  </div>
+</section>
+
+<!-- ===== 视图：系统设置 ===== -->
+<section class="page" id="page-system">
+  <div class="grid2">
+    <div class="panel">
+      <h3><span class="dot"></span>数据面看门狗</h3>
+      <div class="kv">
+        <div class="it"><span class="k">运行状态</span><span class="v" id="wd-state">—</span></div>
+        <div class="it"><span class="k">最近事件</span><span class="v" id="wd-events">—</span></div>
+      </div>
+      <div id="wd-timeline" style="margin-top:8px;max-height:220px;overflow:auto"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="btn-wd-on">启用</button>
+        <button class="btn ghost" id="btn-wd-off">停用</button>
+      </div>
+      <div style="font-size:12px;color:var(--sub);margin-top:8px">防止假连接/断线无人重拨。启用会写入 rc.local 开机自启。</div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>网络体检（一键诊断）</h3>
+      <div class="row"><button class="btn" id="btn-hc">开始体检</button><span id="hc-status" style="font-size:12px;color:var(--sub)">上次体检：—</span></div>
+      <table style="margin-top:10px">
+        <thead><tr><th>检查项</th><th>结果</th></tr></thead>
+        <tbody id="hc-body"><tr><td colspan="2" style="color:var(--sub)">点击"开始体检"执行（约 15 秒）</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>LED 状态联动</h3>
+      <div class="row">
+        <label style="display:inline-flex;gap:8px;align-items:center;cursor:pointer">
+          <span class="switch"><input type="checkbox" id="led-chk"><i></i></span>
+          已连接时点亮
+        </label>
+        <select class="input" id="led-sel" style="max-width:160px"></select>
+        <span style="font-size:12px;color:var(--sub)" id="led-hint">已关闭</span>
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>端口转发与防火墙（只读）</h3>
+      <table>
+        <thead><tr><th>协议</th><th>公网端口</th><th>内网目标</th></tr></thead>
+        <tbody id="nf-body"><tr><td colspan="3" style="color:var(--sub)">读取中…</td></tr></tbody>
+      </table>
+      <div style="font-size:12px;color:var(--sub);margin-top:10px" id="fw-line">—</div>
+    </div>
+    <div class="panel">
+      <h3><span class="dot"></span>刷新设置</h3>
+      <div class="row">
+        <span style="font-size:13px">自动刷新</span>
+        <label style="display:inline-flex;gap:8px;align-items:center;cursor:pointer">
+          <span class="switch"><input type="checkbox" id="ar-chk" checked><i></i></span>
+          启用
+        </label>
+        <select class="input" style="max-width:120px" id="rate-sel">
+          <option value="10" selected>10 秒（推荐）</option>
+          <option value="30">30 秒</option>
+          <option value="60">60 秒</option>
+        </select>
+      </div>
+      <div style="font-size:12px;color:var(--sub);margin-top:8px">局部更新，走 ModemManager 零压力</div>
+    </div>
+    <div class="panel" style="grid-column:1/-1">
+      <h3><span class="dot"></span>设备控制（危险操作）</h3>
+      <div class="danger-zone">
+        <div class="dz-title">以下操作会中断 5G 连接，请谨慎</div>
+        <div class="row">
+          <button class="btn danger" id="btn-reset">重启模块</button>
+          <button class="btn danger" id="btn-disable">禁用模块</button>
+          <button class="btn danger" id="btn-enable">启用模块</button>
+          <button class="btn ghost" id="btn-redial">重拨数据面</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+<div class="toast" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

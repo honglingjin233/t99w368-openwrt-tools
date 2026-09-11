@@ -1,0 +1,10 @@
+{
+	"admin/status/modem5g": {
+		"title": "5G 模块",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "modem5g/status"
+		}
+	}
+}

@@ -97,8 +97,14 @@ function mmStatus(idx) {
 		curPreferred = trim(cm[2]);
 	}
 	// 扩展信号（RSRP/RSRQ/SINR，MM 原生 MBIM signal 扩展，无需 AT 口）
+	// signal-setup 是持久轮询设置：按 modem 索引标记缓存，避免每轮重复 setup
 	let sig5g = {}, sigLte = {};
-	const sigOut = execm("mmcli -m " + idx + " --signal-setup=30 >/dev/null 2>&1; mmcli -m " + idx + " --signal-get --output-json 2>&1", 8);
+	const sigMark = trim(exec("cat /tmp/m5g-sigsetup 2>/dev/null"));
+	if (sigMark != idx) {
+		execm("mmcli -m " + idx + " --signal-setup=30 >/dev/null 2>&1", 8);
+		exec("echo '" + idx + "' > /tmp/m5g-sigsetup");
+	}
+	const sigOut = execm("mmcli -m " + idx + " --signal-get --output-json 2>&1", 8);
 	try {
 		const sj = json(sigOut);
 		const ss = sj && sj.modem && sj.modem.signal ? sj.modem.signal : {};
@@ -200,14 +206,45 @@ function scanState() {
 	return { state: "idle" };
 }
 
-// 多模组适配表（v4 新增）：MM 通用能力对任意 MBIM 模组生效；AT 增强层按模组分发
+// 多模组适配表（v5 扩展：通道 + 命令双维度，实测校准）
+// channel: adb=T99W368 专属 ADB(/dev/at_mdm0)；serial=USB 串口 AT（FM350/RM500）
+// temp_cmd/temp_re：温度查询命令与响应正则（三模组实测校准，勿改回）
+// sig_cmd：5G 信号增强查询（FM350 用 3GPP AT+CESQ；Quectel/T99 用 QENG 双引号）
+// band_read：频段读取命令（RM500 用 QNWPREFCFG 带引号；FM350 用 GTACT；T99 由 MM ngran 提供）
+// mode_cmd：制式切换命令族（前端"锁制式"按钮按此分发）
 const MODULE_ADAPTERS = {
-	"T99W368": { ifname: "wwan0", temp_cmd: "AT+temp?", model_re: /TSENS/ },
-	"FM350-GL": { ifname: "wwan0", temp_cmd: "AT+QTEMP?", model_re: /QTEMP/ },
-	"RM500Q-CN": { ifname: "wwan0", temp_cmd: "AT+QTEMP?", model_re: /QTEMP/ }
+	"T99W368": {
+		ifname: "wwan0", proto: "mbim", vendor: "foxconn", channel: "adb",
+		temp_cmd: "AT+temp?", temp_re: /TSENS:\s*(\d+)/,
+		sig_cmd: 'AT+QENG="servingcell"', sig_kind: "qeng",
+		band_read: "", mode_cmd: "AT+CFUN=1", bands: "t99"
+	},
+	"FM350-GL": {
+		ifname: "wwan0", proto: "rndis", vendor: "fibocom", channel: "serial", at_port: "/dev/ttyUSB1",
+		temp_cmd: "AT+GTSENRDTEMP=1", temp_re: /GTSENRDTEMP[:\s]*(\d+)/,
+		sig_cmd: "AT+CESQ", sig_kind: "cesq",
+		band_read: "AT+GTACT=,,?", mode_cmd: "AT+CFUN=1", bands: "fm350"
+	},
+	"RM500Q-CN": {
+		ifname: "wwan0", proto: "qmi", vendor: "quectel", channel: "serial", at_port: "/dev/ttyUSB2",
+		temp_cmd: "AT+QTEMP", temp_re: /QTEMP:"[^"]*","(\d+)"/,
+		sig_cmd: 'AT+QENG="servingcell"', sig_kind: "qeng",
+		band_read: 'AT+QNWPREFCFG="nr5g_band"', mode_cmd: 'AT+QNWPREFCFG="mode_pref"', bands: "quectel"
+	}
 };
 function adapterFor(model) {
 	return MODULE_ADAPTERS[model] || MODULE_ADAPTERS["T99W368"];
+}
+
+// AT 查询通道分发：T99W368 走 ADB（m5g-at.sh）；其余走串口（m5g-at-serial.sh，端口取适配表/自动探测）
+function atQuery(model, cmd, cache) {
+	const ad = adapterFor(model);
+	const opt = cache ? "cache" : "";
+	if (ad.channel == "serial") {
+		const port = ad.at_port || "/dev/ttyUSB2";
+		return exec("sh /usr/bin/m5g-at-serial.sh '" + port + "' '" + cmd + "' " + opt + " 2>&1");
+	}
+	return exec("sh /usr/bin/m5g-at.sh '" + cmd + "' " + opt + " 2>&1");
 }
 
 const methods = {
@@ -215,6 +252,10 @@ const methods = {
 	status: {
 		call: function(request) {
 			const idx = getModemIndex() || "0";
+			// v5：mmcli 依赖检测（M28C 等无 ModemManager 环境优雅降级）
+			if (!trim(exec("which mmcli 2>/dev/null"))) {
+				return { mm_ok: false, modem_index: idx, error: "未检测到 ModemManager(mmcli)。本插件核心状态依赖 ModemManager；可 opkg install modemmanager 后重载，或在该设备继续使用 QModem 原生界面。" };
+			}
 			const info = mmStatus(idx);
 			const wwan = exec("ip addr show wwan0 2>/dev/null");
 			const sc = scanState();
@@ -449,35 +490,22 @@ const methods = {
 				if (m)
 					push(smsPaths, { index: m[1], state: m[2] });
 			}
-			// 详情只拉最后 5 条（每条 mmcli -s 约 0.1-0.3s，全拉会阻塞 rpcd 串行队列）；其余仅状态
-			// ★ ucode 的 for...in 遍历的是数组元素（非下标），用计数器定位尾部
-			const DETAIL_LIMIT = 5;
 			const list = [];
-			let smsPos = 0;
-			const smsTotal = length(smsPaths);
 			for (let s in smsPaths) {
-				smsPos++;
-				const isDetail = smsPos > smsTotal - DETAIL_LIMIT;
-				if (isDetail) {
-					const out = execm("mmcli -s " + s.index + " --output-json 2>&1", 8);
-					try {
-						const j = json(out);
-						const sms = j && j.sms ? j.sms : {};
-						const cont = sms["content"] || {};
-						const prop = sms["properties"] || {};
-						push(list, {
-							index: s.index,
-							state: prop["state"] || s.state,
-							number: cont["number"] || "",
-							text: cont["text"] || "",
-							timestamp: prop["timestamp"] || ""
-						});
-					} catch (e) {
-						push(list, { index: s.index, state: s.state, number: "", text: "", timestamp: "" });
-					}
-				} else {
-					push(list, { index: s.index, state: s.state, number: "", text: "", timestamp: "" });
-				}
+				const out = execm("mmcli -s " + s.index + " --output-json 2>&1", 8);
+				try {
+					const j = json(out);
+					const sms = j && j.sms ? j.sms : {};
+					const cont = sms["content"] || {};
+					const prop = sms["properties"] || {};
+					push(list, {
+						index: s.index,
+						state: prop["state"] || s.state,
+						number: cont["number"] || "",
+						text: cont["text"] || "",
+						timestamp: prop["timestamp"] || ""
+					});
+				} catch (e) {}
 			}
 			// 倒序：最新在前；上限 20 条（防列表膨胀）
 			const rev = [];
@@ -503,7 +531,7 @@ const methods = {
 			// 文本写文件，用 --messaging-create-sms-with-text 创建：
 			// 属性方式对空格(需 NBSP)和逗号(键值分隔符)都敏感，文件方式任意字符安全
 			writefile("/tmp/m5g-sms.txt", text);
-			const out = execm("mmcli -m " + idx + " --messaging-create-sms=\"" + number + "\" --messaging-create-sms-with-text=/tmp/m5g-sms.txt 2>&1", 20);
+			const out = execm("mmcli -m " + idx + " --messaging-create-sms=number=" + number + " --messaging-create-sms-with-text=/tmp/m5g-sms.txt 2>&1", 20);
 			let m = match(out, /SMS\/(\d+)/);
 			if (!m)
 				return { ok: false, error: "创建短信失败: " + trim(out) };
@@ -519,7 +547,7 @@ const methods = {
 					state = (sj && sj.sms && sj.sms.properties && sj.sms.properties["state"]) || "";
 				} catch (e) {}
 				if (state == "sent" || state == "failed" || state == "unknown") break;
-				sleep(1);
+				try { sleep(1); } catch (e) {}
 			}
 			if (state == "failed") ok = false;
 			let detail;
@@ -527,6 +555,21 @@ const methods = {
 			else if (state == "failed") detail = "发送失败(模块回报 failed): " + trim(sent);
 			else if (state) detail = "已提交，状态: " + state;
 			else detail = ok ? "短信已发送" : "发送失败: " + trim(sent);
+			// 写入本地已发送记录（/tmp/m5g-sent.json，行存储 ts|iso|number|text|ok|detail|sms_id，上限 100 条）
+			// 注：老 ucode 无 String()/json 序列化 → ""+time() 拼接 + 读旧行 + 追加 + 截断 + writefile 全量写回
+			try {
+				const iso = trim(exec("date '+%Y-%m-%d %H:%M:%S'")) || "";
+				const esc_t = replace(replace(replace(text, "|", "/"), "\n", " "), "\r", " ");
+				const esc_d = replace(replace(replace(detail, "|", "/"), "\n", " "), "\r", " ");
+				const rec = "" + time() + "|" + iso + "|" + number + "|" + esc_t + "|" + (ok ? "1" : "0") + "|" + esc_d + "|" + sid;
+				const lines = split(exec("cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
+				push(lines, rec);
+				const st = length(lines) > 100 ? length(lines) - 100 : 0;
+				let content = "";
+				for (let i = st; i < length(lines); i++) content += lines[i] + "\n";
+				writefile("/tmp/m5g-sent.json", content);
+			} catch (e3) {}
+			return { ok: ok, detail: detail, sms_id: sid };
 			return { ok: ok, detail: detail, sms_id: sid };
 		}
 	},
@@ -541,6 +584,45 @@ const methods = {
 			const out = execm("mmcli -m " + idx + " --messaging-delete-sms=" + index + " 2>&1", 10);
 			const ok = !!match(out, /successfully/);
 			return { ok: ok, detail: ok ? "短信已删除" : "删除失败: " + trim(out) };
+		}
+	},
+	// 只读：本地已发送记录（/tmp/m5g-sent.json 行存储，倒序）
+	sms_sent: {
+		call: function() {
+			try {
+				const lines = split(exec("cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
+				const arr = [];
+				for (let i = 0; i < length(lines); i++) {
+					const ln = lines[i];
+					if (ln == "") continue;
+					const f = split(ln, "|");
+					if (length(f) >= 7)
+						push(arr, { ts: f[0], iso: f[1], number: f[2], text: f[3], ok: f[4] == "1", detail: f[5], sms_id: f[6] });
+				}
+				const rev = [];
+				for (let i = length(arr) - 1; i >= 0; i--) push(rev, arr[i]);
+				return { sms: rev };
+			} catch (e) { return { sms: [] }; }
+		}
+	},
+	// 控制：删除本地已发送记录（按 ts）
+	sms_sent_delete: {
+		args: { ts: "" },
+		call: function(request) {
+			const ts = trim(request.args.ts || "");
+			if (!match(ts, /^\d+$/))
+				return { ok: false, error: "参数非法" };
+			try {
+				const lines = split(exec("cat /tmp/m5g-sent.json 2>/dev/null") || "", "\n");
+				let content = "";
+				for (let i = 0; i < length(lines); i++) {
+					const ln = lines[i];
+					if (ln == "") continue;
+					if (split(ln, "|")[0] != ts) content += ln + "\n";
+				}
+				writefile("/tmp/m5g-sent.json", content);
+				return { ok: true, detail: "记录已删除" };
+			} catch (e) { return { ok: false, error: "删除失败" }; }
 		}
 	},
 	// 只读：数据用量（wwan0 接口计数器，会话级）
@@ -645,12 +727,23 @@ const methods = {
 		args: { cmd: "" },
 		call: function(request) {
 			const cmd = trim(request.args.cmd || "");
-			const white = [ "AT", "ATI", "AT+CGMR", "AT+CGSN", "AT+CIMI", "AT+COPS?", "AT+C5GREG?", "AT+CEREG?", "AT+CREG?", "AT+CGREG?", "AT+CFUN?", "AT+CSQ", "AT+CPIN?", "AT+temp?", "AT+CMGF?", "AT+CGDCONT?", "AT+CGACT?", "AT+CGCONTRDP=5", "AT+CGPADDR=5" ];
+			const white = [ "AT", "ATI", "AT+CGMR", "AT+CGSN", "AT+CIMI", "AT+COPS?", "AT+C5GREG?", "AT+CEREG?", "AT+CREG?", "AT+CGREG?", "AT+CFUN?", "AT+CSQ", "AT+CPIN?", "AT+temp?", "AT+QTEMP", "AT+CMGF?", "AT+CGDCONT?", "AT+CGACT?", "AT+CGCONTRDP=5", "AT+CGPADDR=5" ];
 			let allowed = false;
 			for (let c in white)
 				if (c == cmd) allowed = true;
 			// 动态上下文 id（CGCONTRDP/CGPADDR 的 cid 可为 1-9，白名单不再写死 5）
-			if (!allowed && match(cmd, /^(?:AT\+CGCONTRDP=[1-9]|AT\+CGPADDR=[1-9])$/))
+			if (!allowed && match(cmd, /^AT\+CGCONTRDP=[1-9]$|^AT\+CGPADDR=[1-9]$/))
+				allowed = true;
+			// v5 多模组：FM350 的 CESQ/GTSENRDTEMP 与 Quectel 的 QENG(双引号)/QNWPREFCFG 读取形态
+			if (!allowed && match(cmd, /^AT\+CESQ$/))
+				allowed = true;
+			if (!allowed && match(cmd, /^AT\+GTSENRDTEMP=1$/))
+				allowed = true;
+			if (!allowed && match(cmd, /^AT\+QENG="servingcell"$/))
+				allowed = true;
+			if (!allowed && match(cmd, /^AT\+QNWPREFCFG="(?:nr5g_band|lte_band|nsa_nr5g_band|gw_band)"$/))
+				allowed = true;
+			if (!allowed && match(cmd, /^AT\+GTACT=\?\?$|^AT\+GTACT=,,?\?$/))
 				allowed = true;
 			if (!allowed)
 				return { ok: false, error: "仅允许预设只读查询指令" };
@@ -659,24 +752,28 @@ const methods = {
 			return { ok: ok, output: trim(out) || "无响应（模块 AT 引擎可能忙）" };
 		}
 	},
-	// 只读：模块温度（v4 多模组分发：T99W368 用 AT+temp?；RM500/FM350 用 AT+QTEMP?）
+	// 只读：模块温度（v5 实测校准三分发：T99W368=AT+temp?/TSENS；FM350-GL=AT+GTSENRDTEMP=1；RM500Q-CN=AT+QTEMP 无问号）
 	temp: {
-		call: function() {
-			const idx = getModemIndex();
-			let model = "";
-			if (idx) {
+		call: function(request) {
+			// 支持外部传入 model/idx（web_bundle 复用已查的 model，省一次 mmcli）
+			const reqArgs = (request && request.args) || {};
+			const idx = reqArgs.idx || getModemIndex();
+			let model = reqArgs.model || "";
+			if (!model && idx) {
 				let mo = execm("mmcli -m " + idx + " --output-json 2>&1", 6);
 				try {
 					let mj = json(mo);
 					model = (mj && mj.modem && mj.modem.generic && mj.modem.generic["model"]) || "";
 				} catch (e) {}
 			}
-			const cmd = match(model, /RM500|FM350/) ? "AT+QTEMP?" : "AT+temp?";
-			const out = exec("sh /usr/bin/m5g-at.sh '" + cmd + "' cache 2>&1");
-			let m = match(out, /TSENS:\s*(\d+)\s*C?/);
-			if (!m) m = match(out, /QTEMP[:\s]*([\d,]+)/);
+			const ad = adapterFor(model);
+			const out = atQuery(model, ad.temp_cmd, true);
+			let m = match(out, ad.temp_re);
+			if (!m) m = match(out, /TSENS:\s*(\d+)\s*C?/);
+			if (!m) m = match(out, /QTEMP:"[^"]*","(\d+)"/);
+			if (!m) m = match(out, /GTSENRDTEMP[:\s]*(\d+)/);
 			if (!m) m = match(out, /(\d+)\s*C/);
-			return { ok: !!m, tsens: m ? m[1] : "", output: trim(out), model: model, cmd: cmd };
+			return { ok: !!m, tsens: m ? m[1] : "", output: trim(out), model: model, cmd: ad.temp_cmd, channel: ad.channel };
 		}
 	},
 	// 只读：趋势数据（/tmp/m5g-trend.csv 尾部 N 条：ts,rsrp,snr,tsens,rx+tx）
@@ -713,13 +810,11 @@ const methods = {
 						mbps = dr * 8 / dt / 1000000;
 				}
 			}
-			return { ok: true, total_mbps: sprintf("%.2f", mbps),
-				dl_mbps: sprintf("%.2f", mbps), ul_mbps: sprintf("%.2f", mbps),
-				dl: sprintf("%.2f", mbps), ul: sprintf("%.2f", mbps),
-				note: "趋势缓存只存 rx+tx 合计，dl/ul 均等于合计值" };
-			}
-			},
-			// 控制：一键诊断（action=start 后台生成 / action=get 读取报告）
+			return { ok: true, dl_mbps: sprintf("%.2f", mbps), ul_mbps: sprintf("%.2f", mbps),
+				dl: sprintf("%.2f", mbps), ul: sprintf("%.2f", mbps) };
+		}
+	},
+	// 控制：一键诊断（action=start 后台生成 / action=get 读取报告）
 	diagnostic: {
 		args: { action: "" },
 		call: function(request) {
@@ -831,13 +926,7 @@ const methods = {
 			for (let b in rawBands)
 				if (match(b, /^ngran-/))
 					push(bands, b);
-			// 当日 0 点 epoch：busybox ash 无 GNU date -d 也不支持 10# 前缀
-			// → 先 ${H#0} 去前导零（08/09 被当八进制会报错），再算术
-			// 注意：ucode 双引号字符串可能把 ${...} 当模板插值 → 用字符串拼接拆开
-			const t0exp = "N=$(date +%s); H=$(date +%H); M=$(date +%M); S=$(date +%S); "
-				+ "H=$" + "{H#0}; M=$" + "{M#0}; S=$" + "{S#0}; "
-				+ "echo $(( N - H*3600 - M*60 - S ))";
-			const t0 = trim(exec(t0exp)) || "0";
+			const t0 = trim(exec("date +%s -d \"$(date +%F)\" 2>/dev/null")) || "0";
 			const stat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $2!=\"--\" && $2!=\"\" {n++; s+=$2; if(n==1||$2>mx)mx=$2; if(n==1||$2<mn)mn=$2} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
 			const sp = split(trim(stat), " ");
 			const tstat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $4!=\"--\" && $4!=\"\" {n++; s+=$4; if(n==1||$4>mx)mx=$4; if(n==1||$4<mn)mn=$4} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
@@ -917,10 +1006,7 @@ const methods = {
 					monthTotal += d.total;
 			}
 			const today = length(days) ? days[length(days) - 1].day : "";
-			// 空 pid 时 kill -0 '' 会报错 → 先取再判，防空值
-			const tpid = trim(exec("cat /tmp/m5g-traffic.pid 2>/dev/null"));
-			const tAlive = tpid && trim(exec("kill -0 " + tpid + " 2>/dev/null && echo 1"));
-			return { days: days, month_total: monthTotal, today: today, running: !!tAlive };
+			return { days: days, month_total: monthTotal, today: today, running: !!trim(exec("kill -0 $(cat /tmp/m5g-traffic.pid 2>/dev/null) 2>/dev/null && echo 1")) };
 			} catch (e) {
 				return { days: [], month_total: 0, today: "", running: false, error: "异常: " + e };
 			}
@@ -944,22 +1030,8 @@ const methods = {
 			const pp = exec("ping -c 3 -W 2 -I wwan0 223.5.5.5 2>&1") || "";
 			const ps = match(pp, /(\d+) packets transmitted, (\d+) received/);
 			add("公网连通(223.5.5.5)", ps ? int(ps[2]) > 0 : false, ps ? (ps[1] + " 发 / " + ps[2] + " 收") : trim(split(pp, "\n")[0]));
-			const dn0 = exec("nslookup www.baidu.com 2>&1") || "";
-			let dnsOk = !!match(dn0, /Address/);
-			let dnsDetail = dnsOk ? "www.baidu.com 解析成功" : "";
-			// nslookup 可能未装（dnsutils 非默认包）→ 降级 host / ping 域名实测
-			if (!dnsOk) {
-				const dn1 = exec("host www.baidu.com 2>&1") || "";
-				dnsOk = !!match(dn1, /has address/);
-				if (dnsOk) dnsDetail = "www.baidu.com 解析成功(host)";
-			}
-			if (!dnsOk) {
-				const dn2 = exec("ping -c 1 -W 2 -I wwan0 www.baidu.com 2>&1") || "";
-				dnsOk = !!match(dn2, /1 packets received|bytes from/);
-				if (dnsOk) dnsDetail = "www.baidu.com 域名可通(ping 实测)";
-			}
-			if (!dnsOk) dnsDetail = "解析失败(nslookup/host/ping 均不可用)";
-			add("DNS 解析", dnsOk, dnsDetail);
+			const dn = exec("nslookup www.baidu.com 2>&1") || "";
+			add("DNS 解析", !!match(dn, /Address/), match(dn, /Address/) ? "www.baidu.com 解析成功" : "解析失败");
 			const mt = exec("ping -c 1 -W 2 -s 1450 -M do -I wwan0 223.5.5.5 2>&1") || "";
 			const mtOk = !!match(mt, /1 packets received|bytes from/);
 			add("MTU 1450 探测", mtOk, mtOk ? "可通过（数据面可承载 1450B 报文）" : "1450 过大或不支持 -M（可接受，不影响上网）");
@@ -1006,7 +1078,7 @@ const methods = {
 			return { ok: true, detail: "LED 联动已关闭" };
 		}
 	},
-	// ============ v4 新增：多模组适配信息 ============
+	// ============ v5 新增：多模组适配信息（完整能力矩阵数据源） ============
 	module_profile: {
 		call: function() {
 			const idx = getModemIndex();
@@ -1016,12 +1088,336 @@ const methods = {
 			return {
 				model: model,
 				adapter: MODULE_ADAPTERS[model] ? ("内置适配器（" + model + "）") : "回退默认（T99W368 适配）",
+				vendor: ad.vendor,
+				channel: ad.channel,
+				proto: ad.proto,
 				temp_cmd: ad.temp_cmd,
+				sig_cmd: ad.sig_cmd,
+				sig_kind: ad.sig_kind,
+				band_read: ad.band_read,
+				mode_cmd: ad.mode_cmd,
+				bands_profile: ad.bands,
+				at_port: ad.at_port || "",
 				ifname: ad.ifname,
-				note: "状态/拨号/短信走 ModemManager 通用层（任意 MBIM 模组）；温度/AT 增强层按模组分发"
+				note: "状态/拨号/短信走 ModemManager 通用层（任意 MBIM/QMI 模组）；AT 增强层按模组实测校准（通道+命令双维度）"
 			};
-		}
+		},
+		// v5：netfilter_status 已拆分至 modem5g_extra 对象（rpcd 单对象方法数上限 33）
 	}
 };
 
-return { modem5g: methods };
+function nf_payload() {
+					try {
+						const rs = execm("nft list ruleset 2>/dev/null", 8) || "";
+						const lines2 = split(rs, "\n");
+						const rules = [];
+						const fw = { INPUT: { rules: 0, policy: "" }, OUTPUT: { rules: 0, policy: "" }, FORWARD: { rules: 0, policy: "" } };
+						const map = { input: "INPUT", forward: "FORWARD", output: "OUTPUT" };
+						let cur = "";
+						for (let line in lines2) {
+							const t = trim(line);
+							let cm = match(t, /^chain\s+(\w+)\s*\{/);
+							if (cm) { cur = map[cm[1]] || ""; continue; }
+							if (cur) {
+								if (match(t, /^\}/)) { cur = ""; continue; }
+								let pm = match(t, /policy\s+(\w+)/);
+								if (pm) { fw[cur]["policy"] = pm[1]; continue; }
+								if (t == "") continue;
+								fw[cur]["rules"]++;
+							}
+							let dm = match(t, /meta l4proto\s+(\w+)\s+dport\s+(\d+)\s+dnat to\s+([0-9.]+):(\d+)/);
+							if (dm) { push(rules, { proto: dm[1], pub: dm[2], dst: dm[3], dport: dm[4] }); continue; }
+							dm = match(t, /meta l4proto\s+(\w+)\s+dport\s+(\d+)\s+ip daddr\s+([0-9.]+)\s+(tcp|udp)\s+dport\s+(\d+)/);
+							if (dm) push(rules, { proto: dm[1], pub: dm[2], dst: dm[3], dport: dm[4] });
+						}
+						const ct = trim(exec("cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null"));
+						const ctMax = trim(exec("cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null"));
+						return { ok: true, nat_rules: rules, fw: fw, conntrack: ct || "--", conntrack_max: ctMax || "--" };
+					} catch (e) {
+						return { ok: false, error: "异常: " + e };
+					}
+				
+			}
+
+const modem5g_extra = {
+
+
+			// ============ v5 独立对象：netfilter 状态（顶层函数，web_bundle 复用）============
+			netfilter_status: {
+				call: function() { return nf_payload(); }
+			},
+		// ============ v5-Web：整页数据聚合（B 方案静态前端专用，只读，一次返回全部只读数据）============
+		// 供 /luci-static/modem5g/index.html 调用；健康检查/Ping/短信为耗时或重活，由前端按需单独调用
+		web_bundle: {
+			call: function() {
+				try {
+					// 性能优化：mmStatus 只调一次，status/module_profile/deep_signal 字段统一从这里组装
+					// （原实现三个方法各跑一轮 getModemIndex+mmcli，10s 刷新下开销大）
+					const idx = getModemIndex() || "0";
+					const mmOk = !!trim(exec("which mmcli 2>/dev/null"));
+					let info = {};
+					if (mmOk && idx) info = mmStatus(idx);
+					// ---- status 字段组装 ----
+					const wwan = exec("ip addr show wwan0 2>/dev/null");
+					const sc = scanState();
+					const st = {
+						state: info["state"] || "", power_state: info["power_state"] || "",
+						access_tech: info["access_tech"] || "", signal: info["signal"] || "",
+						operator_name: info["operator_name"] || "", operator_id: info["operator_id"] || "",
+						registration: info["registration"] || "", packet_state: info["packet_state"] || "",
+						cur_bands: info["cur_bands"] || [], ngran_bands: info["ngran_bands"] || [],
+						cur_allowed: info["cur_allowed"] || "", cur_preferred: info["cur_preferred"] || "",
+						supported_modes: info["supported_modes"] || [],
+						signal_5g_rsrp: info["signal_5g_rsrp"] || "", signal_5g_rsrq: info["signal_5g_rsrq"] || "", signal_5g_snr: info["signal_5g_snr"] || "",
+						signal_lte_rsrp: info["signal_lte_rsrp"] || "", signal_lte_snr: info["signal_lte_snr"] || "",
+						manufacturer: info["manufacturer"] || "", model: info["model"] || "",
+						firmware: info["firmware"] || "", imei: info["imei"] || "",
+						wwan0_ipv4: firstMatch(wwan, /inet\s+([0-9.]+)/) || "",
+						wwan0_ipv6: firstMatch(execm("ip -6 addr show wwan0 scope global 2>/dev/null", 8), /inet6\s+([0-9a-f:]+)/) || "",
+						cfg_device: trim(exec("uci get network.wwan.device 2>/dev/null")),
+						cfg_apn: trim(exec("uci get network.wwan.apn 2>/dev/null")),
+						scan_state: sc.state, scan_networks: sc.networks || []
+					};
+					// ---- module_profile 组装 ----
+					const model = info["model"] || "";
+					const ad = adapterFor(model);
+					const mp = {
+						model: model,
+						adapter: MODULE_ADAPTERS[model] ? ("内置适配器（" + model + "）") : "回退默认（T99W368 适配）",
+						vendor: ad.vendor, channel: ad.channel, proto: ad.proto,
+						temp_cmd: ad.temp_cmd, sig_cmd: ad.sig_cmd, sig_kind: ad.sig_kind,
+						band_read: ad.band_read, mode_cmd: ad.mode_cmd, bands_profile: ad.bands,
+						at_port: ad.at_port || "", ifname: ad.ifname,
+						note: "状态/拨号/短信走 ModemManager 通用层（任意 MBIM/QMI 模组）；AT 增强层按模组实测校准（通道+命令双维度）"
+					};
+					// ---- deep_signal 组装（bands 过滤 + 今日统计） ----
+					const rawBands = info["cur_bands"] || [];
+					const bands = [];
+					for (let b in rawBands)
+						if (match(b, /^ngran-/))
+							push(bands, b);
+					const t0 = trim(exec("date +%s -d \"$(date +%F)\" 2>/dev/null")) || "0";
+					const stat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $2!=\"--\" && $2!=\"\" {n++; s+=$2; if(n==1||$2>mx)mx=$2; if(n==1||$2<mn)mn=$2} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
+					const sp = split(trim(stat), " ");
+					const tstat = exec("awk -F, -v t0=" + t0 + " 'NR>1 && $1>=t0 && $4!=\"--\" && $4!=\"\" {n++; s+=$4; if(n==1||$4>mx)mx=$4; if(n==1||$4<mn)mn=$4} END{if(n)printf \"%d %d %.1f\", mn, mx, s/n; else printf \"-- -- --\"}' /tmp/m5g-trend.csv 2>/dev/null");
+					const tp = split(trim(tstat), " ");
+					const ds = {
+						tech: info["access_tech"] || "", bands: bands,
+						signal_5g: { rsrp: info["signal_5g_rsrp"] || "", rsrq: info["signal_5g_rsrq"] || "", snr: info["signal_5g_snr"] || "" },
+						signal_lte: { rsrp: info["signal_lte_rsrp"] || "", snr: info["signal_lte_snr"] || "" },
+						today_rsrp: { min: sp[0] || "--", max: sp[1] || "--", avg: sp[2] || "--" },
+						today_tsens: { min: tp[0] || "--", max: tp[1] || "--", avg: tp[2] || "--" }
+					};
+					// ---- 当前占用频段（serving cell 实测；qeng 解析，失败/无信号返回空 → 前端降级启用分布） ----
+					const occ = [];
+					try {
+						const vn = mp["vendor"] || "";
+						if (vn != "fibocom") {
+							const sq = atQuery(model, 'AT+QENG="servingcell"', true) || "";
+							const lines = split(sq, "\n");
+							for (let li = 0; li < length(lines); li++) {
+								if (!match(lines[li], /servingcell/)) continue;
+								const body = replace(replace(lines[li], "+QENG:", ""), "+QENG", "");
+								const f = split(trim(body), ",");
+								if (length(f) < 9) continue;
+								const tech = replace(replace(replace(f[2], '"', ""), "'", ""), " ", "");
+								const band = replace(replace(trim(f[8]), '"', ""), "'", "");
+								if (!match(band, /^[0-9]+$/)) continue;
+								if (tech == "LTE") push(occ, "B" + band);
+								else if (match(tech, /^NR/)) push(occ, "n" + band);
+							}
+						}
+					} catch (e) {}
+					// ---- 宿主机关键实时信息（OpenFi6C 自身：温度/内存/负载/连接/磁盘/运行时长） ----
+					let host = {};
+					try {
+						const htRaw = trim(exec("cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null")) || "";
+						const ml = split(trim(exec("awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{print t,a}' /proc/meminfo 2>/dev/null")), " ");
+						const mtot = length(ml) > 0 ? (ml[0]) * 1 : 0;
+						const mava = length(ml) > 1 ? (ml[1]) * 1 : 0;
+						const mused = mtot && mava ? mtot - mava : 0;
+						const ld = split(trim(exec("cat /proc/loadavg 2>/dev/null")), " ");
+						const upS = trim(exec("awk '{print $1}' /proc/uptime 2>/dev/null")) || "0";
+						const du = split(trim(exec("df -k /overlay 2>/dev/null | awk 'NR==2{print $2,$3}'")), " ");
+						const dtot = length(du) > 0 ? (du[0]) * 1 : 0;
+						const dusd = length(du) > 1 ? (du[1]) * 1 : 0;
+						let ctmp = htRaw ? (htRaw) * 1 / 1000 : 0;
+						if (htRaw * 1 > 100000) ctmp = ctmp / 1000;
+						// 风扇（反极性 PWM：duty 越小转速越高）
+						const pwmD = trim(exec("cat /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null")) || "";
+						const pwmP = trim(exec("cat /sys/class/pwm/pwmchip0/pwm0/period 2>/dev/null")) || "";
+						const pwmE = trim(exec("cat /sys/class/pwm/pwmchip0/pwm0/enable 2>/dev/null")) || "";
+						// 无线芯片温度（mt7915 phy0/phy1 取高）
+						const w1t = trim(exec("cat /sys/class/hwmon/hwmon1/temp1_input 2>/dev/null")) || "0";
+						const w2t = trim(exec("cat /sys/class/hwmon/hwmon2/temp1_input 2>/dev/null")) || "0";
+						// WAN/LAN 实时速率（/proc/net/dev 差值，状态存 /tmp）
+						function netrate(dev, tag) {
+							const line = trim(exec("awk '$1==\"" + dev + ":\"{print $2,$10}' /proc/net/dev 2>/dev/null")) || "";
+							const f = split(line, " ");
+							const rx = length(f) ? f[0] * 1 : 0;
+							const tx = length(f) > 1 ? f[1] * 1 : 0;
+							const prev = trim(exec("cat /tmp/m5g-net-" + tag + " 2>/dev/null")) || "";
+							const pf = split(prev, " ");
+							const now = time();
+							let r = 0, t = 0;
+							if (length(pf) >= 3) {
+								const dt = now - pf[0] * 1;
+								if (dt > 0 && rx >= pf[1] * 1 && tx >= pf[2] * 1) { r = int((rx - pf[1] * 1) / dt); t = int((tx - pf[2] * 1) / dt); }
+							}
+							exec("echo " + now + " " + rx + " " + tx + " > /tmp/m5g-net-" + tag);
+							return { r: r, t: t };
+						}
+						const devw = trim(exec("ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"dev\") print $(i+1)}'")) || "wwan0";
+						const devl = trim(exec("ls /sys/class/net/br-lan >/dev/null 2>&1 && echo br-lan || echo eth0"));
+						const wnr = netrate(devw, "wan");
+						const lnr = netrate(devl, "lan");
+						// 无线客户端数（首个 AP 接口）
+						const wifidev = trim(exec("iw dev 2>/dev/null | awk '/Interface/{print $2; exit}'")) || "";
+						const wsta = wifidev ? ((trim(exec("iw dev " + wifidev + " station dump 2>/dev/null | grep -c Station")) || "0") * 1) : 0;
+						// DHCP 租约数
+						const dhcpn = (trim(exec("awk 'END{print NR}' /tmp/dhcp.leases 2>/dev/null")) || "0") * 1;
+						host = {
+							cpu_temp: htRaw ? ctmp : "--",
+							mem_used: mused, mem_total: mtot,
+							mem_pct: mtot ? int(mused * 100 / mtot + 0.5) : 0,
+							load1: length(ld) ? ld[0] : "--",
+							load5: length(ld) > 1 ? ld[1] : "--",
+							conntrack: trim(exec("cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null")),
+							disk_pct: dtot ? int(dusd * 100 / dtot + 0.5) : 0,
+							uptime_h: int(upS * 1 / 3600),
+							uptime_m: int((upS * 1 - int(upS * 1 / 3600) * 3600) / 60),
+							fan_pct: (pwmP * 1 > 0 && pwmD * 1 >= 0) ? int((pwmP * 1 - pwmD * 1) * 100 / (pwmP * 1) + 0.5) : 0,
+							fan_on: pwmE == "1" ? 1 : 0,
+							wtemp: int((w1t * 1 > w2t * 1 ? w1t : w2t) / 1000 + 0.5),
+							wan_rx: wnr.r, wan_tx: wnr.t, lan_rx: lnr.r, lan_tx: lnr.t,
+							wifi_sta: wsta, dhcp: dhcpn
+						};
+					} catch (e) {}
+					// ---- 其余只读方法（无 mmcli 依赖，保留独立调用） ----
+					const tr = methods.traffic_stats.call() || {};
+					const trendRaw = methods.trend.call({ args: { n: "120" } }) || { points: [] };
+					const sim = methods.sim_info.call() || {};
+					const wd = methods.watchdog_status.call() || {};
+					const wdLog = methods.watchdog_log.call({ args: { n: "30" } }) || { events: [] };
+					const leds = methods.list_leds.call() || {};
+					const nf = nf_payload() || {};
+					const guard = methods.signal_guard.call({ args: { action: "get" } }) || {};
+					const tp2 = methods.temp.call({ args: { model: model, idx: idx } }) || {};
+					// trend 采样：每次聚合追加一点（10s 刷新=10s 采样，同秒去重，窗口 120 点）
+					// 独立于看门狗脚本——看门狗未运行时趋势也能持续更新
+					try {
+						const nowT = "" + time();
+						const lastT = trim(exec("tail -1 /tmp/m5g-trend.csv 2>/dev/null | cut -d, -f1"));
+						if (lastT != nowT) {
+							const rrt = trim(exec("awk '/wwan0/{print $2+$10}' /proc/net/dev 2>/dev/null"));
+							const sigR = info["signal_5g_rsrp"] || "--";
+							const sigS = info["signal_5g_snr"] || "--";
+							const tpT = tp2["tsens"] || "--";
+							exec("echo '" + nowT + "," + sigR + "," + sigS + "," + tpT + "," + (rrt || "0") + "' >> /tmp/m5g-trend.csv; tail -n 120 /tmp/m5g-trend.csv > /tmp/m5g-trend.tmp && mv /tmp/m5g-trend.tmp /tmp/m5g-trend.csv");
+						}
+					} catch (e) { exec("echo '" + e + "' >> /tmp/m5g-trend-err 2>&1"); }
+					// trend 转 ECharts 数组
+					const tsA = [], rsrpA = [], snrA = [], tempA = [], rateA = [];
+					const pts = trendRaw.points || [];
+					for (let i = 0; i < length(pts); i++) {
+						const p = pts[i];
+						push(tsA, (p["t"]) * 1 || 0);
+						push(rsrpA, p["rsrp"] !== "--" ? (p["rsrp"]) * 1 : null);
+						push(snrA, p["snr"] !== "--" ? (p["snr"]) * 1 : null);
+						push(tempA, p["tsens"] !== "--" ? (p["tsens"]) * 1 : null);
+					}
+					for (let i = 1; i < length(pts); i++) {
+						const dt = ((pts[i]["t"]) * 1 - (pts[i - 1]["t"]) * 1) || 60;
+						const r1 = (pts[i - 1]["rt"]) * 1 || 0, r2 = (pts[i]["rt"]) * 1 || 0;
+						const mbps = (r2 - r1) * 8 / dt / 1e6;
+						push(rateA, mbps > 0 ? mbps : 0);
+					}
+					// AT 快捷命令按模组分发（只读白名单）
+					const vendor = mp["vendor"] || "";
+					let atOpts = [];
+					if (vendor == "fibocom")
+						atOpts = [
+							{ cmd: "ATI", label: "ATI" },
+							{ cmd: "AT+CGSN", label: "AT+CGSN" },
+							{ cmd: "AT+CSQ", label: "AT+CSQ" },
+							{ cmd: "AT+CIMI", label: "AT+CIMI" },
+							{ cmd: "AT+COPS?", label: "AT+COPS?" },
+							{ cmd: "AT+CESQ", label: "AT+CESQ" },
+							{ cmd: "AT+GTSENRDTEMP=1", label: "AT+GTSENRDTEMP=1" },
+							{ cmd: "AT+CGPADDR=3", label: "AT+CGPADDR=3" }
+						];
+					else if (vendor == "quectel")
+						atOpts = [
+							{ cmd: "ATI", label: "ATI" },
+							{ cmd: "AT+CGSN", label: "AT+CGSN" },
+							{ cmd: "AT+CSQ", label: "AT+CSQ" },
+							{ cmd: "AT+CIMI", label: "AT+CIMI" },
+							{ cmd: "AT+COPS?", label: "AT+COPS?" },
+							{ cmd: "AT+QENG=\"servingcell\"", label: "AT+QENG" },
+							{ cmd: "AT+QTEMP", label: "AT+QTEMP" },
+							{ cmd: "AT+QNWPREFCFG=\"nr5g_band\"", label: "AT+QNWPREFCFG" }
+						];
+					else
+						atOpts = [
+							{ cmd: "ATI", label: "ATI" },
+							{ cmd: "AT+CGSN", label: "AT+CGSN" },
+							{ cmd: "AT+CSQ", label: "AT+CSQ" },
+							{ cmd: "AT+CIMI", label: "AT+CIMI" },
+							{ cmd: "AT+COPS?", label: "AT+COPS?" },
+							{ cmd: "AT+QENG=\"servingcell\"", label: "AT+QENG" },
+							{ cmd: "AT+CFUN?", label: "AT+CFUN?" }
+						];
+					const fmtBand = function(b) { return replace(b, "ngran-", "n"); };
+					const rawBands2 = ds["bands"] || [];
+					const b5 = [];
+					for (let b in rawBands2) push(b5, fmtBand(b));
+					const days = tr["days"] || [];
+					const flow7 = [];
+					const dLen = length(days);
+					for (let fi = (dLen > 7 ? dLen - 7 : 0); fi < dLen; fi++)
+						push(flow7, days[fi]);
+					const last = length(days) ? days[length(days) - 1] : {};
+					return {
+						ok: true, ts: time(), mm_ok: mmOk, modem_index: idx,
+						state: st["state"] || "", access_tech: st["access_tech"] || "",
+						signal: st["signal"] || 0,
+						rsrp: st["signal_5g_rsrp"] || "", snr: st["signal_5g_snr"] || "", rsrq: st["signal_5g_rsrq"] || "",
+						speed_mbps: rateA.length ? rateA[rateA.length - 1] : 0,
+						today_bytes: last["total"] || 0, today_rx: last["rx"] || 0, today_tx: last["tx"] || 0,
+						month_bytes: tr["month_total"] || 0, temp: tp2["tsens"] || "",
+						operator: st["operator_name"] || "", operator_id: st["operator_id"] || "",
+						registration: st["registration"] || "", packet_state: st["packet_state"] || "",
+						ifname: mp["ifname"] || "wwan0",
+						ipv4: st["wwan0_ipv4"] || "", ipv6: st["wwan0_ipv6"] || "",
+						manufacturer: st["manufacturer"] || "", model: st["model"] || "", firmware: st["firmware"] || "",
+						imei: st["imei"] || "", iccid: sim["iccid"] || "", imsi: sim["imsi"] || "",
+						signal_lte_rsrp: st["signal_lte_rsrp"] || "", signal_lte_snr: st["signal_lte_snr"] || "",
+						today_rsrp: ds["today_rsrp"] || {}, today_tsens: ds["today_tsens"] || {},
+						bands5g: b5, cur_bands: st["cur_bands"] || [], occ_bands: occ,
+						cur_allowed: st["cur_allowed"] || "", cur_preferred: st["cur_preferred"] || "",
+						cfg_apn: st["cfg_apn"] || "",
+						guard: { enabled: !!guard["enabled"], threshold: guard["threshold"] || "-110", cooldown: guard["cooldown"] || "600" },
+						watchdog: { running: !!wd["running"], events: wdLog["events"] || [] },
+						leds: { list: leds["leds"] || [], current: leds["current"] || "", enabled: !!leds["enabled"] },
+						nf: nf,
+						adapter: {
+							adapter: mp["adapter"] || "", vendor: vendor, channel: mp["channel"] || "",
+							proto: mp["proto"] || "", temp_cmd: mp["temp_cmd"] || "", sig_cmd: mp["sig_cmd"] || "",
+							bands_profile: mp["bands_profile"] || "", at_port: mp["at_port"] || ""
+						},
+						at_options: atOpts,
+						trend: { ts: tsA, rsrp: rsrpA, snr: snrA, tsens: tempA, rate: rateA },
+						flow7: flow7,
+						scan_state: st["scan_state"] || "", scan_networks: st["scan_networks"] || [],
+						sim: { state: sim["active"] || "", state_cn: (sim["active"] == "yes" ? "已就绪" : (sim["active"] == "no" ? "未就绪" : "")) },
+						host: host
+					};
+				} catch (e) {
+					return { ok: false, error: "异常: " + e };
+				}
+			}
+		}
+};
+
+return { modem5g: methods, modem5g_extra: modem5g_extra };
+
