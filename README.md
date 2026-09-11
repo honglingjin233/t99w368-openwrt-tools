@@ -22,6 +22,21 @@ LuCI 管理插件、AT 指令逆向成果、模块内部架构分析。
 └── T99W368_OpenFi6C_完整适配文档.md  方案 C 完整适配记录
 ```
 
+## 🖼️ 界面截图
+
+6 个 Tab 实机界面截图(1920×1080)：
+
+| Tab | 预览 | 路径 |
+|-----|------|------|
+| 仪表盘 | ![dashboard](modem5g-plugin/screenshots/dashboard.png) | `modem5g-plugin/screenshots/dashboard.png` |
+| 网络状态 | ![network-status](modem5g-plugin/screenshots/network-status.png) | `modem5g-plugin/screenshots/network-status.png` |
+| 网络配置 | ![network-config](modem5g-plugin/screenshots/network-config.png) | `modem5g-plugin/screenshots/network-config.png` |
+| 短信中心 | ![sms](modem5g-plugin/screenshots/sms.png) | `modem5g-plugin/screenshots/sms.png` |
+| AT 调试 | ![atdebug](modem5g-plugin/screenshots/atdebug.png) | `modem5g-plugin/screenshots/atdebug.png` |
+| 系统设置 | ![system](modem5g-plugin/screenshots/system.png) | `modem5g-plugin/screenshots/system.png` |
+
+> 短信页的来电电话号码已打码;IMEI/ICCID/IMSI 前端本身掩码显示。
+
 ## ✨ 插件功能
 
 - **状态三卡**：连接状态（5G 载波/LTE 锚点信号 RSRP/SINR）、模块信息（IMEI/ICCID/IMSI/温度）、数据面（IP/会话流量）
