@@ -84,6 +84,11 @@ while true; do
 	if [ -n "$IP" ]; then
 		GW=$(ip route 2>/dev/null | awk '/default/ && /wwan0/ {print $3; exit}')
 		if [ -n "$GW" ] && ! ping -c 2 -W 2 "$GW" >/dev/null 2>&1; then
+			# ⚠️ 实测(2026-09-11)：移动 5G 网关(如 10.57.15.220)禁 ICMP——
+			#    ping 网关 100% 丢包是正常现象，数据面仍通（公网可达），≠ 断网！
+			#    09-09 旧版脚本见"网关不通"即记"假连接"日志刷屏 293 条，
+			#    实为噪音，绝大部分未真断网。切勿删除下面的二次确认，
+			#    网关 ping 不通必须继续验证公网 DNS 才可判定假连接。
 			# 二次确认：换公网 DNS 探测（防运营商禁 ICMP 误判导致重拨风暴）
 			if ! ping -c 1 -W 2 -I wwan0 223.5.5.5 >/dev/null 2>&1 \
 			   && ! ping -c 1 -W 2 -I wwan0 119.29.29.29 >/dev/null 2>&1; then
